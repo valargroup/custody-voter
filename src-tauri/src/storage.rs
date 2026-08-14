@@ -716,24 +716,33 @@ fn replace_restored_files(
     manifest: &ProfileManifest,
 ) -> Result<(), String> {
     let previous_database = paths.directory.join("voting.sqlite.before-restore");
-    let _ = fs::remove_file(&previous_database);
+    match fs::remove_file(&previous_database) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "remove stale staged voting database {} failed: {error}",
+                previous_database.display()
+            ));
+        }
+    }
     let had_database = paths.database.exists();
     if had_database {
         fs::rename(&paths.database, &previous_database)
             .map_err(|error| format!("stage current voting database failed: {error}"))?;
     }
     if let Err(error) = fs::rename(restored_database, &paths.database) {
-        if had_database {
-            let _ = fs::rename(&previous_database, &paths.database);
-        }
-        return Err(format!("activate restored voting database failed: {error}"));
+        let error = format!("activate restored voting database failed: {error}");
+        return Err(restored_file_error(
+            error,
+            rollback_restored_database(paths, &previous_database, had_database),
+        ));
     }
     if let Err(error) = write_manifest(paths, manifest) {
-        let _ = fs::remove_file(&paths.database);
-        if had_database {
-            let _ = fs::rename(&previous_database, &paths.database);
-        }
-        return Err(error);
+        return Err(restored_file_error(
+            error,
+            rollback_restored_database(paths, &previous_database, had_database),
+        ));
     }
     let _ = fs::remove_file(previous_database);
     for suffix in ["-wal", "-shm"] {
@@ -741,6 +750,46 @@ fn replace_restored_files(
         let _ = fs::remove_file(stale);
     }
     Ok(())
+}
+
+/// Restores the pre-activation database and reports every failed rollback step.
+fn rollback_restored_database(
+    paths: &ProfilePaths,
+    previous_database: &Path,
+    had_database: bool,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    match fs::remove_file(&paths.database) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => errors.push(format!(
+            "remove failed restored voting database {} failed: {error}",
+            paths.database.display()
+        )),
+    }
+    if had_database {
+        if let Err(error) = fs::rename(previous_database, &paths.database) {
+            errors.push(format!(
+                "reactivate previous voting database {} as {} failed: {error}",
+                previous_database.display(),
+                paths.database.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn restored_file_error(error: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback_error) => {
+            format!("{error}; restoring the previous voting database also failed: {rollback_error}")
+        }
+    }
 }
 
 fn encrypt_age(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
@@ -964,6 +1013,33 @@ mod tests {
         );
 
         assert_eq!(round_ids, BTreeSet::from(["recoverable-round".to_string()]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_reports_when_database_rollback_fails() {
+        let root =
+            std::env::temp_dir().join(format!("custody-voter-failed-rollback-{}", Uuid::new_v4()));
+        let paths = profile_paths(&root, Profile::Testnet).unwrap();
+        fs::write(&paths.database, b"previous database").unwrap();
+        fs::create_dir(&paths.manifest).unwrap();
+        let restored_database = root.join("restored-database");
+        fs::create_dir(&restored_database).unwrap();
+
+        let error = replace_restored_files(
+            &paths,
+            &restored_database,
+            &ProfileManifest::empty(Profile::Testnet),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("restoring the previous voting database also failed"));
+        assert!(error.contains("remove failed restored voting database"));
+        assert!(error.contains("reactivate previous voting database"));
+        assert!(paths
+            .directory
+            .join("voting.sqlite.before-restore")
+            .exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
