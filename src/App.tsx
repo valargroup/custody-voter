@@ -80,6 +80,7 @@ function App() {
   const selectedRef = useRef<string | null>(null);
   const roundsRequestRef = useRef(0);
   const workspaceRequestRef = useRef(0);
+  const restoreFileRequestRef = useRef(0);
 
   selectedRef.current = selectedRoundId;
 
@@ -378,7 +379,24 @@ function App() {
     setNotice(`Restored ${result.roundCount} round(s) into the ${profileLabel(profile)} profile.`);
   };
 
+  const handleRestoreFile = async (file: File | undefined) => {
+    const requestId = ++restoreFileRequestRef.current;
+    setRestoreBytes(null);
+    setRestoreFilename(file?.name ?? null);
+    if (!file) return;
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (requestId !== restoreFileRequestRef.current) return;
+      setRestoreBytes(bytes);
+    } catch (caught) {
+      if (requestId !== restoreFileRequestRef.current) return;
+      setRestoreFilename(null);
+      setError(`Read recovery backup failed: ${errorMessage(caught)}`);
+    }
+  };
+
   const closeBackupDialog = () => {
+    restoreFileRequestRef.current += 1;
     setBackupMode(null);
     setPassphrase("");
     setConfirmPassphrase("");
@@ -387,6 +405,9 @@ function App() {
   };
 
   const openBackupFromSettings = (mode: Exclude<BackupMode, null>) => {
+    restoreFileRequestRef.current += 1;
+    setRestoreBytes(null);
+    setRestoreFilename(null);
     setSettingsOpen(false);
     setBackupMode(mode);
   };
@@ -1334,14 +1355,7 @@ function App() {
                 <input
                   type="file"
                   accept=".age,application/octet-stream"
-                  onChange={(event) => {
-                    const file = event.target.files?.[0];
-                    if (!file) return;
-                    void file.arrayBuffer().then((buffer) => {
-                      setRestoreBytes(new Uint8Array(buffer));
-                      setRestoreFilename(file.name);
-                    });
-                  }}
+                  onChange={(event) => void handleRestoreFile(event.target.files?.[0])}
                 />
               </label>
             )}
