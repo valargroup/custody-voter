@@ -207,7 +207,7 @@ jobs:
             "$RELEASE_DIR/Custody-Voter-macos.dmg"
             "$RELEASE_DIR/Custody-Voter-macos.dmg.sha256"
           )
-          RELEASE_FLAGS=()
+          RELEASE_FLAGS=(--draft --generate-notes)
           RELEASE_VERSION="${RELEASE_TAG#v}"
           VERSION_WITHOUT_BUILD_METADATA="${RELEASE_VERSION%%+*}"
           if [[ "$VERSION_WITHOUT_BUILD_METADATA" == *-* ]]; then
@@ -233,8 +233,6 @@ jobs:
             fi
           else
             gh release create "$RELEASE_TAG" \
-              --draft \
-              --generate-notes \
               "${RELEASE_FLAGS[@]}" \
               --title "Zcash Custody Voter $RELEASE_TAG" \
               --verify-tag \
