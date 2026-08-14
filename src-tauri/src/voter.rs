@@ -237,8 +237,23 @@ async fn refresh_delegations_once(
         if position.is_some() {
             continue;
         }
-        let Some(confirmation) =
-            chain::get_tx_confirmation(client, &round.vote_servers, &tx_hash).await?
+        let Some(confirmation) = chain::get_validated_tx_confirmation(
+            client,
+            &round.vote_servers,
+            &tx_hash,
+            |confirmation| {
+                confirm_delegation_submission(
+                    db,
+                    &round.round_id,
+                    bundle_index,
+                    &tx_hash,
+                    &confirmation.events,
+                )
+                .map(|_| ())
+                .map_err(|error| format!("confirm custody delegation failed: {error}"))
+            },
+        )
+        .await?
         else {
             continue;
         };
@@ -252,14 +267,6 @@ async fn refresh_delegations_once(
                 confirmation.log
             });
         }
-        confirm_delegation_submission(
-            db,
-            &round.round_id,
-            bundle_index,
-            &tx_hash,
-            &confirmation.events,
-        )
-        .map_err(|error| format!("confirm custody delegation failed: {error}"))?;
     }
     Ok(())
 }
@@ -809,8 +816,26 @@ async fn finish_live_vote(
             None,
             "Waiting for vote-chain confirmation".to_string(),
         );
-        let confirmation =
-            chain::poll_tx_confirmation(client, &round.vote_servers, &tx_hash).await?;
+        let db = open_db(paths, profile)?;
+        let confirmation = chain::poll_validated_tx_confirmation(
+            client,
+            &round.vote_servers,
+            &tx_hash,
+            |confirmation| {
+                let parsed = confirm_vote_submission(
+                    &db,
+                    &round.round_id,
+                    bundle_index,
+                    commitment.proposal_id,
+                    &tx_hash,
+                    &confirmation.events,
+                )
+                .map_err(|error| format!("record vote confirmation failed: {error}"))?;
+                vc_position = Some(parsed.vc_tree_position);
+                Ok(())
+            },
+        )
+        .await?;
         if confirmation.code != 0 {
             return Err(if confirmation.log.trim().is_empty() {
                 format!("vote transaction failed with code {}", confirmation.code)
@@ -818,17 +843,6 @@ async fn finish_live_vote(
                 confirmation.log
             });
         }
-        let db = open_db(paths, profile)?;
-        let parsed = confirm_vote_submission(
-            &db,
-            &round.round_id,
-            bundle_index,
-            commitment.proposal_id,
-            &tx_hash,
-            &confirmation.events,
-        )
-        .map_err(|error| format!("record vote confirmation failed: {error}"))?;
-        vc_position = Some(parsed.vc_tree_position);
     }
     let vc_position = vc_position.expect("vote confirmation set a VC position");
     emit_progress(
