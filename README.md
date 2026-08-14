@@ -118,3 +118,12 @@ cargo test test_custodian::tests::recovers_account_zero_and_scans_real_testnet_b
 - The first release is a desktop app. There is no hosted web version because a browser would put voting-secret storage and native proof dependencies behind a weaker boundary.
 - Mainnet and Testnet use the currently pinned Valar voting configuration revisions. Updating those trust anchors is an intentional source change and release event.
 - Distribution signing, notarization, and an update channel are deployment work. Local development and unsigned local bundles work without them.
+
+## License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project is dual licensed as above, without any additional
+terms or conditions.

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Customer application for custody-delegated Zcash voting"
 authors = ["Valar"]
 edition = "2021"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/valargroup/custody-voter"
 publish = false
 
