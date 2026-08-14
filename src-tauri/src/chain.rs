@@ -456,15 +456,24 @@ pub async fn get_tx_confirmation(
             Ok(response) if response.status() == StatusCode::NOT_FOUND => continue,
             Ok(response) => {
                 let status = response.status();
-                let bytes = bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await?;
+                let bytes = match bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", server.label));
+                        continue;
+                    }
+                };
                 if status.is_success() || status == StatusCode::UNPROCESSABLE_ENTITY {
-                    let confirmation: TxConfirmation =
-                        serde_json::from_slice(&bytes).map_err(|error| {
-                            format!("decode transaction confirmation failed: {error}")
-                        })?;
-                    return Ok(Some(confirmation));
+                    match serde_json::from_slice(&bytes) {
+                        Ok(confirmation) => return Ok(Some(confirmation)),
+                        Err(error) => errors.push(format!(
+                            "{} returned a malformed transaction confirmation: {error}",
+                            server.label
+                        )),
+                    }
+                } else {
+                    errors.push(format!("{} returned HTTP {status}", server.label));
                 }
-                errors.push(format!("{} returned HTTP {status}", server.label));
             }
             Err(error) => errors.push(format!("{}: {error}", server.label)),
         }
@@ -748,7 +757,41 @@ fn response_message(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
     use super::*;
+
+    fn confirmation_server(
+        label: &str,
+        body: &str,
+    ) -> (ServiceEndpointView, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        (
+            ServiceEndpointView {
+                url: format!("http://{address}"),
+                label: label.to_string(),
+            },
+            handle,
+        )
+    }
 
     #[test]
     fn active_status_accepts_numeric_and_proto_names() {
@@ -779,6 +822,26 @@ mod tests {
         assert!(validate_tx_hash(&"AB".repeat(32)).is_ok());
         assert!(validate_tx_hash("../../unexpected").is_err());
         assert!(validate_tx_hash(&"a".repeat(63)).is_err());
+    }
+
+    #[tokio::test]
+    async fn confirmation_check_skips_a_malformed_server() {
+        let (malformed, malformed_handle) = confirmation_server("malformed", "{");
+        let (healthy, healthy_handle) =
+            confirmation_server("healthy", r#"{"code":0,"log":"confirmed","events":[]}"#);
+        let confirmation = get_tx_confirmation(
+            &http_client().unwrap(),
+            &[malformed, healthy],
+            &"ab".repeat(32),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(confirmation.code, 0);
+        assert_eq!(confirmation.log, "confirmed");
+        malformed_handle.join().unwrap();
+        healthy_handle.join().unwrap();
     }
 
     #[test]
