@@ -1,0 +1,208 @@
+name: Signed macOS release
+
+run-name: macOS release ${{ inputs.release_tag || github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to build, for example v1 or v1.0.1
+        required: true
+        type: string
+
+concurrency:
+  group: macos-release-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Sign, notarize, and publish DMG
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Validate the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+([.][0-9]+){0,2}([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must look like v1, v1.0.0, or v1.0.0-rc.1." >&2
+            exit 1
+          fi
+
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Import the Developer ID certificate
+        id: signing
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          for required_name in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_ID \
+            APPLE_PASSWORD \
+            APPLE_TEAM_ID
+          do
+            if [[ -z "${!required_name:-}" ]]; then
+              echo "Missing required Actions secret: $required_name" >&2
+              exit 1
+            fi
+          done
+
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/custody-voter-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+          SIGNING_IDENTITY="$(
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH" |
+              sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' |
+              head -n 1
+          )"
+          if [[ -z "$SIGNING_IDENTITY" ]]; then
+            echo "The imported archive does not contain a valid Developer ID Application identity." >&2
+            exit 1
+          fi
+
+          printf 'signing_identity=%s\n' "$SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
+
+      - name: Build, sign, notarize, and staple the universal DMG
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.signing_identity }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          npm run tauri -- build --target universal-apple-darwin --bundles app,dmg
+
+      - name: Verify the signed release
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUNDLE_ROOT="src-tauri/target/universal-apple-darwin/release/bundle"
+          APP_PATH="$(find "$BUNDLE_ROOT/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          DMG_PATH="$(find "$BUNDLE_ROOT/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          if [[ -z "$APP_PATH" || -z "$DMG_PATH" ]]; then
+            echo "The production app or DMG was not produced." >&2
+            exit 1
+          fi
+
+          EXECUTABLE_NAME="$(
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist"
+          )"
+          ARCHITECTURES="$(lipo -archs "$APP_PATH/Contents/MacOS/$EXECUTABLE_NAME")"
+          [[ " $ARCHITECTURES " == *" arm64 "* ]]
+          [[ " $ARCHITECTURES " == *" x86_64 "* ]]
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type execute --verbose=2 "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          xcrun stapler validate "$DMG_PATH"
+          spctl --assess \
+            --type open \
+            --context context:primary-signature \
+            --verbose=2 \
+            "$DMG_PATH"
+
+          RELEASE_DIR="$RUNNER_TEMP/custody-voter-release"
+          mkdir -p "$RELEASE_DIR"
+          cp "$DMG_PATH" "$RELEASE_DIR/Custody-Voter-macos.dmg"
+          (
+            cd "$RELEASE_DIR"
+            shasum -a 256 Custody-Voter-macos.dmg > Custody-Voter-macos.dmg.sha256
+          )
+          printf 'release_dir=%s\n' "$RELEASE_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIR: ${{ steps.artifact.outputs.release_dir }}
+        run: |
+          set -euo pipefail
+
+          ASSETS=(
+            "$RELEASE_DIR/Custody-Voter-macos.dmg"
+            "$RELEASE_DIR/Custody-Voter-macos.dmg.sha256"
+          )
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "${ASSETS[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" \
+              "${ASSETS[@]}" \
+              --generate-notes \
+              --latest \
+              --title "Zcash Custody Voter $RELEASE_TAG" \
+              --verify-tag \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+
+      - name: Remove temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/custody-voter-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/developer-id.p12"

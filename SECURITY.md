@@ -36,7 +36,7 @@ The hotkey is stored in the operating-system credential store. The React UI rece
 - It cannot protect a hotkey on a fully compromised customer computer.
 - It does not move, custody, or spend Zcash funds.
 - It does not make entering a valuable wallet mnemonic into a development build safe. The custodian simulator is Testnet-only by design and its provider-side job data is not included in customer backups.
-- Local development builds are not code signed or notarized for distribution.
+- GitHub release DMGs are Developer ID signed and notarized. Local development builds remain unsigned unless the operator supplies the release signing environment.
 
 ## Reporting a vulnerability
 

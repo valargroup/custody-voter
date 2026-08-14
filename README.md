@@ -113,11 +113,38 @@ cd src-tauri
 cargo test test_custodian::tests::recovers_account_zero_and_scans_real_testnet_blocks -- --ignored --exact
 ```
 
+## Signed macOS releases
+
+The `Signed macOS release` GitHub Actions workflow builds the exact commit named by a version tag as a production-optimized universal macOS application. It signs the app with Developer ID, submits it to Apple's notarization service, staples the notarization ticket, verifies both the app and DMG with Apple's command-line tools, and then publishes these release assets:
+
+- `Custody-Voter-macos.dmg`
+- `Custody-Voter-macos.dmg.sha256`
+
+Pushing a tag such as `v1.0.1` starts the workflow. The manual workflow input can rebuild an existing tag, which is useful for replacing an older unsigned asset without moving that tag. Release-asset visibility follows the repository's GitHub visibility.
+
+The workflow requires these encrypted Actions secrets:
+
+- `APPLE_CERTIFICATE`: base64-encoded PKCS #12 archive containing the Developer ID Application certificate and its private key
+- `APPLE_CERTIFICATE_PASSWORD`: export password for that PKCS #12 archive
+- `APPLE_ID`: Apple Account email used for notarization
+- `APPLE_PASSWORD`: a dedicated Apple app-specific password, never the normal Apple Account password
+- `APPLE_TEAM_ID`: Apple Developer Program team identifier
+
+The certificate is imported into a temporary CI keychain and removed at the end of the job. Keep the original signing key in the macOS Keychain, revoke the app-specific password if CI access is no longer needed, and revoke the Developer ID certificate immediately if its private key might have been exposed. Do not place any of these values in repository files or workflow logs.
+
+After downloading a release on macOS, its checksum and Apple assessment can be checked with:
+
+```sh
+shasum -a 256 -c Custody-Voter-macos.dmg.sha256
+spctl --assess --type open --context context:primary-signature --verbose=2 Custody-Voter-macos.dmg
+xcrun stapler validate Custody-Voter-macos.dmg
+```
+
 ## Current scope
 
 - The first release is a desktop app. There is no hosted web version because a browser would put voting-secret storage and native proof dependencies behind a weaker boundary.
 - Mainnet and Testnet use the currently pinned Valar voting configuration revisions. Updating those trust anchors is an intentional source change and release event.
-- Distribution signing, notarization, and an update channel are deployment work. Local development and unsigned local bundles work without them.
+- GitHub release DMGs are signed and notarized for direct macOS distribution. An automatic update channel remains future deployment work.
 
 ## License
 
