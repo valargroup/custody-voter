@@ -223,30 +223,63 @@ jobs:
         run: |
           set -euo pipefail
 
-          require_remote_tag_at_build_commit() {
-            local remote_commit remote_refs
+          read_git_object() {
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$1" \
+              --jq '[.object.type, .object.sha] | @tsv'
+          }
 
-            if ! remote_refs="$(
-              git ls-remote --exit-code --tags \
-                "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
-                "refs/tags/$RELEASE_TAG" \
-                "refs/tags/$RELEASE_TAG^{}"
+          resolve_remote_tag_commit() {
+            local git_object object_sha object_type
+
+            if ! git_object="$(
+              read_git_object \
+                "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+                2>/dev/null
             )"; then
-              echo "Remote tag $RELEASE_TAG no longer exists; refusing to publish this build." >&2
-              exit 1
+              echo "Remote tag $RELEASE_TAG no longer exists or could not be read." >&2
+              return 1
             fi
-            remote_commit="$(
-              printf '%s\n' "$remote_refs" |
-                awk \
-                  -v exact="refs/tags/$RELEASE_TAG" \
-                  -v peeled="refs/tags/$RELEASE_TAG^{}" '
-                    $2 == peeled { print $1; selected = 1; exit }
-                    $2 == exact { fallback = $1 }
-                    END { if (!selected && fallback) print fallback }
-                  '
-            )"
-            if [[ -z "$remote_commit" ]]; then
-              echo "Remote tag $RELEASE_TAG could not be resolved; refusing to publish this build." >&2
+
+            for _ in {1..16}; do
+              IFS=$'\t' read -r object_type object_sha <<< "$git_object"
+              if [[ -z "$object_type" || -z "$object_sha" ]]; then
+                echo "Remote tag $RELEASE_TAG returned an invalid Git object." >&2
+                return 1
+              fi
+              case "$object_type" in
+                commit)
+                  printf '%s\n' "$object_sha"
+                  return 0
+                  ;;
+                tag)
+                  if ! git_object="$(
+                    read_git_object \
+                      "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                      2>/dev/null
+                  )"; then
+                    echo "Annotated tag object $object_sha could not be read." >&2
+                    return 1
+                  fi
+                  ;;
+                *)
+                  echo "Remote tag $RELEASE_TAG points to unsupported object type $object_type." >&2
+                  return 1
+                  ;;
+              esac
+            done
+
+            echo "Remote tag $RELEASE_TAG has too many nested tag objects." >&2
+            return 1
+          }
+
+          require_remote_tag_at_build_commit() {
+            local remote_commit
+
+            if ! remote_commit="$(resolve_remote_tag_commit)"; then
+              echo "Remote tag $RELEASE_TAG no longer exists; refusing to publish this build." >&2
               exit 1
             fi
             if [[ "$remote_commit" != "$BUILT_COMMIT" ]]; then
