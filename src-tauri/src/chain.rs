@@ -77,8 +77,19 @@ pub async fn list_rounds(client: &Client, profile: Profile) -> Result<Vec<RoundS
         return Ok(vec![crate::demo::round_snapshot()]);
     }
     let environment = resolve_environment(client, profile).await?;
-    let response = get_from_vote_servers(client, &environment, "/shielded-vote/v1/rounds").await?;
-    let root: Value = serde_json::from_slice(&response)
+    let servers = vote_server_views(&environment);
+    get_from_vote_servers(client, &servers, "/shielded-vote/v1/rounds", |response| {
+        parse_round_list_response(profile, &environment, response)
+    })
+    .await
+}
+
+fn parse_round_list_response(
+    profile: Profile,
+    environment: &ResolvedVotingConfig,
+    response: &[u8],
+) -> Result<Vec<RoundSnapshot>, String> {
+    let root: Value = serde_json::from_slice(response)
         .map_err(|error| format!("decode vote-chain round list failed: {error}"))?;
     let values = root
         .get("rounds")
@@ -113,7 +124,7 @@ pub async fn list_rounds(client: &Client, profile: Profile) -> Result<Vec<RoundS
             ));
         }
         rounds.push(
-            parse_round(profile, &environment, value)
+            parse_round(profile, environment, value)
                 .map_err(|error| format!("authenticated round {round_id} is invalid: {error}"))?,
         );
     }
@@ -164,13 +175,25 @@ pub async fn fetch_round(
         ));
     }
     let path = format!("/shielded-vote/v1/round/{round_id}");
-    let response = get_from_vote_servers(client, &environment, &path).await?;
-    let root: Value = serde_json::from_slice(&response)
+    let servers = vote_server_views(&environment);
+    get_from_vote_servers(client, &servers, &path, |response| {
+        parse_round_response(profile, &environment, round_id, response)
+    })
+    .await
+}
+
+fn parse_round_response(
+    profile: Profile,
+    environment: &ResolvedVotingConfig,
+    round_id: &str,
+    response: &[u8],
+) -> Result<RoundSnapshot, String> {
+    let root: Value = serde_json::from_slice(response)
         .map_err(|error| format!("decode vote-chain round failed: {error}"))?;
     let value = root
         .get("round")
         .ok_or_else(|| "vote-chain round response is missing round".to_string())?;
-    let round = parse_round(profile, &environment, value)?;
+    let round = parse_round(profile, environment, value)?;
     if round.round_id != round_id {
         return Err("vote-chain returned a different round id".to_string());
     }
@@ -202,14 +225,7 @@ fn parse_round(
     let proposals = parse_proposals(value.get("proposals"))?;
     let status = parse_status(value.get("status"))?;
     let (status_label, is_active) = status_details(&status);
-    let vote_servers = environment
-        .vote_servers
-        .iter()
-        .map(|endpoint| ServiceEndpointView {
-            url: endpoint.url.clone(),
-            label: endpoint.label.clone(),
-        })
-        .collect();
+    let vote_servers = vote_server_views(environment);
     Ok(RoundSnapshot {
         profile,
         chain_id: profile.chain_id().to_string(),
@@ -229,6 +245,17 @@ fn parse_round(
         vote_servers,
         authenticated: true,
     })
+}
+
+fn vote_server_views(environment: &ResolvedVotingConfig) -> Vec<ServiceEndpointView> {
+    environment
+        .vote_servers
+        .iter()
+        .map(|endpoint| ServiceEndpointView {
+            url: endpoint.url.clone(),
+            label: endpoint.label.clone(),
+        })
+        .collect()
 }
 
 fn parse_proposals(value: Option<&Value>) -> Result<Vec<AppProposal>, String> {
@@ -557,13 +584,17 @@ async fn post_vote_servers(
     Err(format!("all vote servers failed: {}", errors.join("; ")))
 }
 
-async fn get_from_vote_servers(
+async fn get_from_vote_servers<T, F>(
     client: &Client,
-    environment: &ResolvedVotingConfig,
+    servers: &[ServiceEndpointView],
     path: &str,
-) -> Result<Vec<u8>, String> {
+    mut validate: F,
+) -> Result<T, String>
+where
+    F: FnMut(&[u8]) -> Result<T, String>,
+{
     let mut errors = Vec::new();
-    for server in &environment.vote_servers {
+    for server in servers {
         let url = endpoint_url(&server.url, path);
         match client
             .get(&url)
@@ -572,7 +603,17 @@ async fn get_from_vote_servers(
             .await
         {
             Ok(response) if response.status().is_success() => {
-                return bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await;
+                let bytes = match bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", server.label));
+                        continue;
+                    }
+                };
+                match validate(&bytes) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => errors.push(format!("{}: {error}", server.label)),
+                }
             }
             Ok(response) => errors.push(format!(
                 "{} returned HTTP {}",
@@ -765,10 +806,7 @@ mod tests {
 
     use super::*;
 
-    fn confirmation_server(
-        label: &str,
-        body: &str,
-    ) -> (ServiceEndpointView, thread::JoinHandle<()>) {
+    fn response_server(label: &str, body: &str) -> (ServiceEndpointView, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let body = body.to_string();
@@ -826,9 +864,9 @@ mod tests {
 
     #[tokio::test]
     async fn confirmation_check_skips_a_malformed_server() {
-        let (malformed, malformed_handle) = confirmation_server("malformed", "{");
+        let (malformed, malformed_handle) = response_server("malformed", "{");
         let (healthy, healthy_handle) =
-            confirmation_server("healthy", r#"{"code":0,"log":"confirmed","events":[]}"#);
+            response_server("healthy", r#"{"code":0,"log":"confirmed","events":[]}"#);
         let confirmation = get_tx_confirmation(
             &http_client().unwrap(),
             &[malformed, healthy],
@@ -840,6 +878,27 @@ mod tests {
 
         assert_eq!(confirmation.code, 0);
         assert_eq!(confirmation.log, "confirmed");
+        malformed_handle.join().unwrap();
+        healthy_handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn validated_get_skips_a_malformed_success_response() {
+        let (malformed, malformed_handle) = response_server("malformed", "{");
+        let (healthy, healthy_handle) = response_server("healthy", r#"{"rounds":[]}"#);
+        let response = get_from_vote_servers(
+            &http_client().unwrap(),
+            &[malformed, healthy],
+            "/shielded-vote/v1/rounds",
+            |bytes| {
+                serde_json::from_slice::<Value>(bytes)
+                    .map_err(|error| format!("decode round list failed: {error}"))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response, serde_json::json!({"rounds": []}));
         malformed_handle.join().unwrap();
         healthy_handle.join().unwrap();
     }
