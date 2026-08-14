@@ -162,7 +162,7 @@ pub fn delete_hotkey(profile: Profile, round_id: &str) -> Result<(), String> {
 
 /// Removes every known local voting profile and its associated Keychain hotkeys.
 ///
-/// Hotkeys are captured before deletion so a Keychain failure can restore the
+/// Hotkeys are captured before deletion so a reset failure can restore the
 /// previous credentials while the corresponding manifests are still available.
 pub fn reset_all_data(app_data_dir: &Path) -> Result<ResetResult, String> {
     let mut profiles = Vec::new();
@@ -198,28 +198,16 @@ pub fn reset_all_data(app_data_dir: &Path) -> Result<ResetResult, String> {
         Ok::<_, String>(())
     })();
     if let Err(error) = keyring_reset {
-        let mut rollback_errors = Vec::new();
-        for (profile, _, hotkeys) in &profiles {
-            if let Err(rollback_error) = restore_captured_hotkeys(*profile, hotkeys) {
-                rollback_errors.push(rollback_error);
-            }
-        }
-        return Err(if rollback_errors.is_empty() {
-            error
-        } else {
-            format!(
-                "{error}; restoring the previous Keychain state also failed: {}",
-                rollback_errors.join("; ")
-            )
-        });
+        return Err(reset_error_with_hotkey_rollback(error, &profiles));
     }
     if app_data_dir.exists() {
-        fs::remove_dir_all(app_data_dir).map_err(|error| {
-            format!(
+        if let Err(error) = fs::remove_dir_all(app_data_dir) {
+            let error = format!(
                 "remove application data directory {} failed: {error}",
                 app_data_dir.display()
-            )
-        })?;
+            );
+            return Err(reset_error_with_hotkey_rollback(error, &profiles));
+        }
     }
 
     Ok(ResetResult {
@@ -673,6 +661,26 @@ fn restore_captured_hotkeys(profile: Profile, captured: &CapturedHotkeys) -> Res
         Ok(())
     } else {
         Err(errors.join("; "))
+    }
+}
+
+fn reset_error_with_hotkey_rollback(
+    error: String,
+    profiles: &[(Profile, ProfilePaths, CapturedHotkeys)],
+) -> String {
+    let mut rollback_errors = Vec::new();
+    for (profile, _, hotkeys) in profiles {
+        if let Err(rollback_error) = restore_captured_hotkeys(*profile, hotkeys) {
+            rollback_errors.push(rollback_error);
+        }
+    }
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        format!(
+            "{error}; restoring the previous Keychain state also failed: {}",
+            rollback_errors.join("; ")
+        )
     }
 }
 
