@@ -80,6 +80,7 @@ function App() {
   const selectedRef = useRef<string | null>(null);
   const roundsRequestRef = useRef(0);
   const workspaceRequestRef = useRef(0);
+  const capabilityFileRequestRef = useRef(0);
   const restoreFileRequestRef = useRef(0);
 
   selectedRef.current = selectedRoundId;
@@ -168,6 +169,7 @@ function App() {
   );
 
   useEffect(() => {
+    capabilityFileRequestRef.current += 1;
     setInactiveRoundsOpen(false);
     setRounds([]);
     setSelectedRoundId(null);
@@ -189,6 +191,7 @@ function App() {
 
   const selectRound = async (roundId: string) => {
     roundsRequestRef.current += 1;
+    capabilityFileRequestRef.current += 1;
     setSelectedRoundId(roundId);
     setCapabilityText("");
     setCapabilityBytes(null);
@@ -233,6 +236,7 @@ function App() {
       api.generateDemoCapability(workspace.round.roundId),
     );
     if (!text) return;
+    capabilityFileRequestRef.current += 1;
     setCapabilityText(text);
     setCapabilityBytes(new TextEncoder().encode(text));
     setCapabilityFilename("demo-delegation-capability.json");
@@ -340,14 +344,25 @@ function App() {
   };
 
   const handleCapabilityFile = async (file: File | undefined) => {
+    const requestId = ++capabilityFileRequestRef.current;
+    setCapabilityBytes(null);
+    setCapabilityText("");
+    setCapabilityFilename(file?.name ?? null);
     if (!file) return;
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    setCapabilityBytes(bytes);
-    setCapabilityText(new TextDecoder().decode(bytes));
-    setCapabilityFilename(file.name);
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (requestId !== capabilityFileRequestRef.current) return;
+      setCapabilityBytes(bytes);
+      setCapabilityText(new TextDecoder().decode(bytes));
+    } catch (caught) {
+      if (requestId !== capabilityFileRequestRef.current) return;
+      setCapabilityFilename(null);
+      setError(`Read custody payload failed: ${errorMessage(caught)}`);
+    }
   };
 
   const setCapabilityFromText = (text: string) => {
+    capabilityFileRequestRef.current += 1;
     setCapabilityText(text);
     setCapabilityBytes(text ? new TextEncoder().encode(text) : null);
     setCapabilityFilename(null);
@@ -441,6 +456,7 @@ function App() {
     setRounds([]);
     setSelectedRoundId(null);
     setWorkspace(null);
+    capabilityFileRequestRef.current += 1;
     setCapabilityText("");
     setCapabilityBytes(null);
     setCapabilityFilename(null);
