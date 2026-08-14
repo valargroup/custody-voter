@@ -540,10 +540,11 @@ function App() {
   const roundCanPrepare = Boolean(
     workspace &&
       (profile === "demo" ||
-        workspace.round.isActive ||
-        ["4", "pending", "session_status_pending"].includes(
-          workspace.round.status.trim().toLowerCase(),
-        )),
+        (workspace.round.voteEndTime > Math.floor(Date.now() / 1000) &&
+          (workspace.round.isActive ||
+            ["4", "pending", "session_status_pending"].includes(
+              workspace.round.status.trim().toLowerCase(),
+            )))),
   );
   const custodianBirthday = Number(custodianBirthdayHeight);
   const canRunTestCustodian = Boolean(
@@ -819,7 +820,7 @@ function App() {
                       <span>
                         {roundCanPrepare
                           ? "One independent hotkey is created per network and round."
-                          : "New targets are limited to pending and active rounds."}
+                          : "New targets are limited to pending and active rounds before voting ends."}
                       </span>
                     </div>
                     <button

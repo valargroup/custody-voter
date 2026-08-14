@@ -450,13 +450,19 @@ pub async fn submit_share(client: &Client, server_url: &str, body: &str) -> Resu
     Ok(())
 }
 
-pub async fn poll_tx_confirmation(
+pub async fn poll_validated_tx_confirmation<F>(
     client: &Client,
     servers: &[ServiceEndpointView],
     tx_hash: &str,
-) -> Result<TxConfirmation, String> {
+    mut validate: F,
+) -> Result<TxConfirmation, String>
+where
+    F: FnMut(&TxConfirmation) -> Result<(), String>,
+{
     for attempt in 0..TX_CONFIRMATION_ATTEMPTS {
-        if let Some(confirmation) = get_tx_confirmation(client, servers, tx_hash).await? {
+        if let Some(confirmation) =
+            get_tx_confirmation_with(client, servers, tx_hash, &mut validate).await?
+        {
             return Ok(confirmation);
         }
         if attempt + 1 < TX_CONFIRMATION_ATTEMPTS {
@@ -474,6 +480,30 @@ pub async fn get_tx_confirmation(
     servers: &[ServiceEndpointView],
     tx_hash: &str,
 ) -> Result<Option<TxConfirmation>, String> {
+    get_tx_confirmation_with(client, servers, tx_hash, &mut accept_any_confirmation).await
+}
+
+pub async fn get_validated_tx_confirmation<F>(
+    client: &Client,
+    servers: &[ServiceEndpointView],
+    tx_hash: &str,
+    mut validate: F,
+) -> Result<Option<TxConfirmation>, String>
+where
+    F: FnMut(&TxConfirmation) -> Result<(), String>,
+{
+    get_tx_confirmation_with(client, servers, tx_hash, &mut validate).await
+}
+
+async fn get_tx_confirmation_with<F>(
+    client: &Client,
+    servers: &[ServiceEndpointView],
+    tx_hash: &str,
+    validate: &mut F,
+) -> Result<Option<TxConfirmation>, String>
+where
+    F: FnMut(&TxConfirmation) -> Result<(), String>,
+{
     validate_tx_hash(tx_hash)?;
     let path = format!("/shielded-vote/v1/tx/{tx_hash}");
     let mut errors = Vec::new();
@@ -491,8 +521,19 @@ pub async fn get_tx_confirmation(
                     }
                 };
                 if status.is_success() || status == StatusCode::UNPROCESSABLE_ENTITY {
-                    match serde_json::from_slice(&bytes) {
-                        Ok(confirmation) => return Ok(Some(confirmation)),
+                    match serde_json::from_slice::<TxConfirmation>(&bytes) {
+                        Ok(confirmation) => {
+                            if confirmation.code == 0 {
+                                if let Err(error) = validate(&confirmation) {
+                                    errors.push(format!(
+                                        "{} returned an unusable transaction confirmation: {error}",
+                                        server.label
+                                    ));
+                                    continue;
+                                }
+                            }
+                            return Ok(Some(confirmation));
+                        }
                         Err(error) => errors.push(format!(
                             "{} returned a malformed transaction confirmation: {error}",
                             server.label
@@ -512,6 +553,10 @@ pub async fn get_tx_confirmation(
         ));
     }
     Ok(None)
+}
+
+fn accept_any_confirmation(_: &TxConfirmation) -> Result<(), String> {
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -897,6 +942,35 @@ mod tests {
         assert_eq!(confirmation.code, 0);
         assert_eq!(confirmation.log, "confirmed");
         malformed_handle.join().unwrap();
+        healthy_handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn validated_confirmation_skips_an_unusable_success_response() {
+        let (unusable, unusable_handle) =
+            response_server("unusable", r#"{"code":0,"log":"","events":[]}"#);
+        let (healthy, healthy_handle) = response_server(
+            "healthy",
+            r#"{"code":0,"log":"confirmed","events":[{"type":"cast_vote","attributes":[]}]}"#,
+        );
+        let confirmation = get_validated_tx_confirmation(
+            &http_client().unwrap(),
+            &[unusable, healthy],
+            &"ab".repeat(32),
+            |confirmation| {
+                if confirmation.events.is_empty() {
+                    Err("missing expected confirmation event".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(confirmation.log, "confirmed");
+        unusable_handle.join().unwrap();
         healthy_handle.join().unwrap();
     }
 

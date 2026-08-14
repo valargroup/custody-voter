@@ -89,7 +89,14 @@ pub fn generate_target(
             reused: true,
         });
     }
-    if !round_accepts_setup(profile, &round) {
+    let now = unix_seconds()?;
+    if !round_accepts_setup(profile, &round, now) {
+        if !profile.is_demo() && round.vote_end_time <= now {
+            return Err(
+                "the voting deadline has passed and this round no longer accepts new voting targets"
+                    .to_string(),
+            );
+        }
         return Err(format!(
             "round is {} and no longer accepts new voting targets",
             round.status_label.to_lowercase()
@@ -237,8 +244,23 @@ async fn refresh_delegations_once(
         if position.is_some() {
             continue;
         }
-        let Some(confirmation) =
-            chain::get_tx_confirmation(client, &round.vote_servers, &tx_hash).await?
+        let Some(confirmation) = chain::get_validated_tx_confirmation(
+            client,
+            &round.vote_servers,
+            &tx_hash,
+            |confirmation| {
+                confirm_delegation_submission(
+                    db,
+                    &round.round_id,
+                    bundle_index,
+                    &tx_hash,
+                    &confirmation.events,
+                )
+                .map(|_| ())
+                .map_err(|error| format!("confirm custody delegation failed: {error}"))
+            },
+        )
+        .await?
         else {
             continue;
         };
@@ -252,14 +274,6 @@ async fn refresh_delegations_once(
                 confirmation.log
             });
         }
-        confirm_delegation_submission(
-            db,
-            &round.round_id,
-            bundle_index,
-            &tx_hash,
-            &confirmation.events,
-        )
-        .map_err(|error| format!("confirm custody delegation failed: {error}"))?;
     }
     Ok(())
 }
@@ -809,8 +823,26 @@ async fn finish_live_vote(
             None,
             "Waiting for vote-chain confirmation".to_string(),
         );
-        let confirmation =
-            chain::poll_tx_confirmation(client, &round.vote_servers, &tx_hash).await?;
+        let db = open_db(paths, profile)?;
+        let confirmation = chain::poll_validated_tx_confirmation(
+            client,
+            &round.vote_servers,
+            &tx_hash,
+            |confirmation| {
+                let parsed = confirm_vote_submission(
+                    &db,
+                    &round.round_id,
+                    bundle_index,
+                    commitment.proposal_id,
+                    &tx_hash,
+                    &confirmation.events,
+                )
+                .map_err(|error| format!("record vote confirmation failed: {error}"))?;
+                vc_position = Some(parsed.vc_tree_position);
+                Ok(())
+            },
+        )
+        .await?;
         if confirmation.code != 0 {
             return Err(if confirmation.log.trim().is_empty() {
                 format!("vote transaction failed with code {}", confirmation.code)
@@ -818,17 +850,6 @@ async fn finish_live_vote(
                 confirmation.log
             });
         }
-        let db = open_db(paths, profile)?;
-        let parsed = confirm_vote_submission(
-            &db,
-            &round.round_id,
-            bundle_index,
-            commitment.proposal_id,
-            &tx_hash,
-            &confirmation.events,
-        )
-        .map_err(|error| format!("record vote confirmation failed: {error}"))?;
-        vc_position = Some(parsed.vc_tree_position);
     }
     let vc_position = vc_position.expect("vote confirmation set a VC position");
     emit_progress(
@@ -1103,8 +1124,14 @@ pub fn validate_stored_round(stored: &StoredRound, fresh: &RoundSnapshot) -> Res
     Ok(())
 }
 
-fn round_accepts_setup(profile: Profile, round: &RoundSnapshot) -> bool {
-    if profile.is_demo() || round.is_active {
+fn round_accepts_setup(profile: Profile, round: &RoundSnapshot, now: u64) -> bool {
+    if profile.is_demo() {
+        return true;
+    }
+    if round.vote_end_time <= now {
+        return false;
+    }
+    if round.is_active {
         return true;
     }
     matches!(
@@ -1163,6 +1190,24 @@ mod tests {
         let mut changed_proposal = original;
         changed_proposal.proposals[0].options[0].label = "Changed choice".to_string();
         assert!(validate_stored_round(&stored, &changed_proposal).is_err());
+    }
+
+    #[test]
+    fn new_target_setup_requires_a_future_voting_deadline() {
+        let mut round = crate::demo::round_snapshot();
+        round.vote_end_time = 100;
+
+        assert!(round_accepts_setup(Profile::Testnet, &round, 99));
+        assert!(!round_accepts_setup(Profile::Testnet, &round, 100));
+
+        round.is_active = false;
+        round.status = "pending".to_string();
+        assert!(round_accepts_setup(Profile::Testnet, &round, 99));
+        assert!(!round_accepts_setup(Profile::Testnet, &round, 100));
+
+        round.status = "finalized".to_string();
+        assert!(!round_accepts_setup(Profile::Testnet, &round, 99));
+        assert!(round_accepts_setup(Profile::Demo, &round, 100));
     }
 
     #[test]
