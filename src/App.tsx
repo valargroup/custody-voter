@@ -535,6 +535,8 @@ function App() {
   )
     ? "Finalized rounds"
     : "Inactive rounds";
+  const contextChangeBlocked =
+    busy !== null && busy !== "rounds" && busy !== "workspace";
 
   return (
     <div className={`app-shell profile-${profile}`}>
@@ -561,7 +563,7 @@ function App() {
               onClick={() => setProfile(item.id)}
               role="tab"
               aria-selected={profile === item.id}
-              disabled={busy === "vote" || busy === "custodian"}
+              disabled={contextChangeBlocked}
             >
               <span>{item.label}</span>
               <small>{item.eyebrow}</small>
@@ -607,7 +609,7 @@ function App() {
                       key={round.roundId}
                       round={round}
                       selected={selectedRoundId === round.roundId}
-                      disabled={busy === "vote" || busy === "custodian"}
+                      disabled={contextChangeBlocked}
                       onSelect={selectRound}
                     />
                   ))
@@ -633,7 +635,7 @@ function App() {
                           key={round.roundId}
                           round={round}
                           selected={selectedRoundId === round.roundId}
-                          disabled={busy === "vote" || busy === "custodian"}
+                          disabled={contextChangeBlocked}
                           onSelect={selectRound}
                         />
                       ))}
