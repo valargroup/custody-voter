@@ -180,14 +180,13 @@ pub fn reset_all_data(app_data_dir: &Path) -> Result<ResetResult, String> {
             manifest: directory.join("manifest.json"),
             directory,
         };
-        let manifest = read_manifest(&paths, profile)?;
+        let round_ids = recoverable_round_ids(&paths, profile);
         removed_rounds = removed_rounds
             .checked_add(
-                u32::try_from(manifest.rounds.len())
+                u32::try_from(round_ids.len())
                     .map_err(|_| "stored round count exceeds u32".to_string())?,
             )
             .ok_or_else(|| "stored round count exceeds u32".to_string())?;
-        let round_ids = manifest.rounds.keys().cloned().collect::<BTreeSet<_>>();
         let hotkeys = capture_hotkeys(profile, &round_ids)?;
         profiles.push((profile, paths, hotkeys));
     }
@@ -635,15 +634,22 @@ fn restore_rollback_round_ids(
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
+    round_ids.extend(recoverable_round_ids(paths, profile));
+    round_ids
+}
+
+/// Collects every round identifier available from readable local state.
+fn recoverable_round_ids(paths: &ProfilePaths, profile: Profile) -> BTreeSet<String> {
+    let mut round_ids = BTreeSet::new();
     if let Ok(current_manifest) = read_manifest(paths, profile) {
         round_ids.extend(current_manifest.rounds.keys().cloned());
     }
-    round_ids.extend(database_round_ids_for_restore(paths, profile));
+    round_ids.extend(database_round_ids(paths, profile));
     round_ids
 }
 
 /// Best-effort fallback for identifiers that a damaged manifest cannot provide.
-fn database_round_ids_for_restore(paths: &ProfilePaths, profile: Profile) -> Vec<String> {
+fn database_round_ids(paths: &ProfilePaths, profile: Profile) -> Vec<String> {
     if !paths.database.exists() {
         return Vec::new();
     }
@@ -1048,6 +1054,20 @@ mod tests {
 
         let result = reset_all_data(&root).unwrap();
         assert_eq!(result.removed_profiles, 2);
+        assert_eq!(result.removed_rounds, 0);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn reset_all_data_removes_a_profile_with_a_damaged_manifest() {
+        let root =
+            std::env::temp_dir().join(format!("custody-voter-reset-damaged-{}", Uuid::new_v4()));
+        let paths = profile_paths(&root, Profile::Testnet).unwrap();
+        fs::write(&paths.manifest, b"{").unwrap();
+
+        let result = reset_all_data(&root).unwrap();
+
+        assert_eq!(result.removed_profiles, 1);
         assert_eq!(result.removed_rounds, 0);
         assert!(!root.exists());
     }
