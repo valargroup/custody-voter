@@ -196,18 +196,33 @@ jobs:
             RELEASE_FLAGS+=(--prerelease)
           fi
 
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" \
-              "${ASSETS[@]}" \
-              --clobber \
-              --repo "$GITHUB_REPOSITORY"
+          if RELEASE_IS_DRAFT="$(
+            gh release view "$RELEASE_TAG" \
+              --json isDraft \
+              --jq .isDraft \
+              --repo "$GITHUB_REPOSITORY" \
+              2>/dev/null
+          )"; then
+            :
           else
             gh release create "$RELEASE_TAG" \
-              "${ASSETS[@]}" \
+              --draft \
               --generate-notes \
               "${RELEASE_FLAGS[@]}" \
               --title "Zcash Custody Voter $RELEASE_TAG" \
               --verify-tag \
+              --repo "$GITHUB_REPOSITORY"
+            RELEASE_IS_DRAFT=true
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            "${ASSETS[@]}" \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+
+          if [[ "$RELEASE_IS_DRAFT" == "true" ]]; then
+            gh release edit "$RELEASE_TAG" \
+              --draft=false \
               --repo "$GITHUB_REPOSITORY"
           fi
 
