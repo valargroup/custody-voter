@@ -1,6 +1,6 @@
-# Valar Custody Voter
+# Zcash Custody Voter
 
-Valar Custody Voter is the customer-side application for custody-delegated Zcash voting. A custodian keeps control of the customer's funds while the customer creates and controls a separate voting hotkey, imports the custodian's delegation capability, and casts private votes.
+Zcash Custody Voter is the customer-side application for custody-delegated Zcash voting. A custodian keeps control of the customer's funds while the customer creates and controls a separate voting hotkey, imports the custodian's delegation capability, and casts private votes.
 
 The app supports Mainnet, Testnet, and a self-contained Local Demo. It is a Tauri desktop application so voting secrets and proof generation remain in native Rust rather than browser storage or JavaScript.
 

@@ -10,6 +10,7 @@ import type {
   TestCustodianResult,
   VoteProgressEvent,
 } from "./types";
+import appIconUrl from "../src-tauri/icons/icon.png";
 import "./App.css";
 
 const DEFAULT_TESTNET_LIGHTWALLETD = "https://testnet.zec.rocks:443";
@@ -415,12 +416,10 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark" aria-hidden="true">
-            <span />
-            <span />
-            <span />
+            <img src={appIconUrl} alt="" />
           </div>
           <div>
-            <strong>Valar</strong>
+            <strong>Zcash</strong>
             <span>Custody Voter</span>
           </div>
         </div>
@@ -1070,7 +1069,7 @@ function App() {
             {backupMode === "restore" && (
               <label className="file-drop compact">
                 <UploadIcon />
-                <strong>{restoreFilename ?? "Choose a Valar .age backup"}</strong>
+                <strong>{restoreFilename ?? "Choose a Zcash Custody Voter .age backup"}</strong>
                 <input
                   type="file"
                   accept=".age,application/octet-stream"

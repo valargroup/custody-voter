@@ -92,28 +92,13 @@ svg {
 }
 
 .brand-mark {
-  position: relative;
   width: 38px;
   height: 38px;
-  border-radius: 11px;
-  background: var(--accent);
-  overflow: hidden;
-  box-shadow: 0 0 30px rgba(184, 243, 64, 0.16);
+  flex: 0 0 38px;
+  filter: drop-shadow(0 0 14px rgba(39, 192, 214, 0.13));
 }
 
-.brand-mark span {
-  position: absolute;
-  width: 7px;
-  height: 27px;
-  top: 6px;
-  border-radius: 5px;
-  background: #11170b;
-  transform: rotate(36deg);
-}
-
-.brand-mark span:nth-child(1) { left: 7px; }
-.brand-mark span:nth-child(2) { left: 16px; height: 20px; top: 9px; }
-.brand-mark span:nth-child(3) { left: 25px; }
+.brand-mark img { display: block; width: 100%; height: 100%; object-fit: contain; }
 
 .brand > div:last-child {
   display: flex;

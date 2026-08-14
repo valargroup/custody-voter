@@ -266,5 +266,5 @@ pub fn run() {
             reset_demo,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Valar Custody Voter");
+        .expect("error while running Zcash Custody Voter");
 }
