@@ -157,6 +157,27 @@ pub struct ImportResult {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct TestCustodianResult {
+    pub capability_json: String,
+    pub digest: String,
+    pub bundle_count: u32,
+    pub submitted_bundle_count: u32,
+    pub delegation_transaction_hashes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCustodianProgressEvent {
+    pub round_id: String,
+    pub phase: String,
+    pub bundle_index: Option<u32>,
+    pub bundle_count: Option<u32>,
+    pub progress: Option<f64>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct VoteChoiceInput {
     pub proposal_id: u32,
     pub choice: u32,

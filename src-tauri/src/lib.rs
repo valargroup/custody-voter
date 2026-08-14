@@ -2,13 +2,14 @@ mod chain;
 mod demo;
 mod model;
 mod storage;
+mod test_custodian;
 mod voter;
 
 use std::{collections::HashSet, fs, path::PathBuf};
 
 use model::{
     BackupResult, CastVotesResult, ImportResult, Profile, ResetResult, RestoreResult, RoundCard,
-    RoundWorkspace, TargetResult, VoteChoiceInput,
+    RoundWorkspace, TargetResult, TestCustodianResult, VoteChoiceInput,
 };
 use reqwest::Client;
 use storage::{profile_paths, read_manifest, round_progress, vote_records};
@@ -149,6 +150,39 @@ async fn check_delegation_confirmations(
 }
 
 #[tauri::command]
+async fn generate_testnet_custody_payload(
+    app: tauri::AppHandle,
+    round_id: String,
+    birthday_height: u64,
+    mnemonic: String,
+    lightwalletd_url: String,
+    state: State<'_, AppState>,
+) -> Result<TestCustodianResult, String> {
+    let _guard = state.operation_lock.lock().await;
+    let profile = Profile::Testnet;
+    let paths = profile_paths(&state.app_data_dir, profile)?;
+    let manifest = read_manifest(&paths, profile)?;
+    let stored = manifest.rounds.get(&round_id).ok_or_else(|| {
+        "generate the customer target before running the test custodian".to_string()
+    })?;
+    let round = chain::fetch_round(&state.client, profile, &round_id).await?;
+    voter::validate_stored_round(stored, &round)?;
+    test_custodian::generate_payload(
+        app,
+        state.client.clone(),
+        state.app_data_dir.clone(),
+        test_custodian::GeneratePayloadRequest {
+            round,
+            target_json: stored.target_json.clone(),
+            birthday_height,
+            mnemonic,
+            lightwalletd_url,
+        },
+    )
+    .await
+}
+
+#[tauri::command]
 async fn cast_votes(
     app: tauri::AppHandle,
     profile: Profile,
@@ -225,6 +259,7 @@ pub fn run() {
             generate_demo_capability,
             import_capability,
             check_delegation_confirmations,
+            generate_testnet_custody_payload,
             cast_votes,
             export_backup,
             restore_backup,

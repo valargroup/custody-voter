@@ -6,9 +6,13 @@ import type {
   Profile,
   RoundCard,
   RoundWorkspace,
+  TestCustodianProgressEvent,
+  TestCustodianResult,
   VoteProgressEvent,
 } from "./types";
 import "./App.css";
+
+const DEFAULT_TESTNET_LIGHTWALLETD = "https://testnet.zec.rocks:443";
 
 const PROFILES: Array<{ id: Profile; label: string; eyebrow: string }> = [
   { id: "demo", label: "Local Demo", eyebrow: "Offline rehearsal" },
@@ -21,6 +25,7 @@ type BusyAction =
   | "workspace"
   | "target"
   | "capability"
+  | "custodian"
   | "confirmation"
   | "vote"
   | "backup"
@@ -50,6 +55,14 @@ function App() {
   const [confirmPassphrase, setConfirmPassphrase] = useState("");
   const [restoreBytes, setRestoreBytes] = useState<Uint8Array | null>(null);
   const [restoreFilename, setRestoreFilename] = useState<string | null>(null);
+  const [custodianOpen, setCustodianOpen] = useState(false);
+  const [custodianBirthdayHeight, setCustodianBirthdayHeight] = useState("");
+  const [custodianMnemonic, setCustodianMnemonic] = useState("");
+  const [showCustodianMnemonic, setShowCustodianMnemonic] = useState(false);
+  const [lightwalletdUrl, setLightwalletdUrl] = useState(DEFAULT_TESTNET_LIGHTWALLETD);
+  const [custodianAcknowledged, setCustodianAcknowledged] = useState(false);
+  const [custodianProgress, setCustodianProgress] = useState<TestCustodianProgressEvent | null>(null);
+  const [custodianResult, setCustodianResult] = useState<TestCustodianResult | null>(null);
   const selectedRef = useRef<string | null>(null);
   const roundsRequestRef = useRef(0);
   const workspaceRequestRef = useRef(0);
@@ -60,6 +73,16 @@ function App() {
     let unlisten: (() => void) | undefined;
     void listen<VoteProgressEvent>("vote-progress", ({ payload }) => {
       if (payload.roundId === selectedRef.current) setVoteProgress(payload);
+    }).then((stop) => {
+      unlisten = stop;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<TestCustodianProgressEvent>("custodian-progress", ({ payload }) => {
+      if (payload.roundId === selectedRef.current) setCustodianProgress(payload);
     }).then((stop) => {
       unlisten = stop;
     });
@@ -132,6 +155,7 @@ function App() {
     setCapabilityFilename(null);
     setVoteResult(null);
     setVoteProgress(null);
+    resetCustodianForm();
     setNotice(null);
     void loadRounds(profile);
   }, [profile]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -149,6 +173,7 @@ function App() {
     setCapabilityFilename(null);
     setVoteResult(null);
     setVoteProgress(null);
+    resetCustodianForm();
     setNotice(null);
     await loadWorkspace(roundId);
   };
@@ -190,6 +215,50 @@ function App() {
     setCapabilityBytes(new TextEncoder().encode(text));
     setCapabilityFilename("demo-delegation-capability.json");
     setNotice("Sample custody payload generated. Import it below exactly as provided.");
+  };
+
+  const resetCustodianForm = () => {
+    setCustodianOpen(false);
+    setCustodianBirthdayHeight("");
+    setCustodianMnemonic("");
+    setShowCustodianMnemonic(false);
+    setLightwalletdUrl(DEFAULT_TESTNET_LIGHTWALLETD);
+    setCustodianAcknowledged(false);
+    setCustodianProgress(null);
+    setCustodianResult(null);
+  };
+
+  const generateTestnetPayload = async () => {
+    if (!workspace) return;
+    const birthdayHeight = Number(custodianBirthdayHeight);
+    if (!Number.isSafeInteger(birthdayHeight)) return;
+    setCustodianProgress({
+      roundId: workspace.round.roundId,
+      phase: "starting",
+      bundleIndex: null,
+      bundleCount: null,
+      progress: null,
+      message: "Starting the recoverable Testnet custody job",
+    });
+    const result = await runAction("custodian", () =>
+      api
+        .generateTestnetCustodyPayload(
+          workspace.round.roundId,
+          birthdayHeight,
+          custodianMnemonic,
+          lightwalletdUrl,
+        )
+        .finally(() => setCustodianMnemonic("")),
+    );
+    if (!result) return;
+    setCustodianResult(result);
+    setCapabilityFromText(result.capabilityJson);
+    setCapabilityFilename(
+      `testnet-custody-capability-${workspace.round.roundId.slice(0, 10)}.json`,
+    );
+    setNotice(
+      `${result.submittedBundleCount} Testnet delegation transaction${result.submittedBundleCount === 1 ? " was" : "s were"} accepted. The exact customer payload is ready below.`,
+    );
   };
 
   const importCapability = async () => {
@@ -330,6 +399,16 @@ function App() {
           workspace.round.status.trim().toLowerCase(),
         )),
   );
+  const custodianBirthday = Number(custodianBirthdayHeight);
+  const canRunTestCustodian = Boolean(
+    workspace &&
+      Number.isSafeInteger(custodianBirthday) &&
+      custodianBirthday > 0 &&
+      custodianBirthday <= workspace.round.snapshotHeight &&
+      custodianMnemonic.trim() &&
+      lightwalletdUrl.trim() &&
+      custodianAcknowledged,
+  );
 
   return (
     <div className={`app-shell profile-${profile}`}>
@@ -358,7 +437,7 @@ function App() {
               onClick={() => setProfile(item.id)}
               role="tab"
               aria-selected={profile === item.id}
-              disabled={busy === "vote"}
+              disabled={busy === "vote" || busy === "custodian"}
             >
               <span>{item.label}</span>
               <small>{item.eyebrow}</small>
@@ -399,7 +478,7 @@ function App() {
                 key={round.roundId}
                 className={`round-row ${selectedRoundId === round.roundId ? "active" : ""}`}
                 onClick={() => void selectRound(round.roundId)}
-                disabled={busy === "vote"}
+                disabled={busy === "vote" || busy === "custodian"}
               >
                 <div>
                   <span className={`status-pin ${round.isActive ? "live" : "closed"}`} />
@@ -609,6 +688,160 @@ function App() {
                   </div>
                 ) : (
                   <>
+                    {profile === "testnet" && (
+                      <div className={`test-custodian ${custodianOpen ? "open" : ""}`}>
+                        <div className="test-custodian-heading">
+                          <div className="test-custodian-icon"><WalletIcon /></div>
+                          <div>
+                            <span className="section-kicker">Local integration harness</span>
+                            <strong>Generate this payload with a real Testnet wallet</strong>
+                            <p>
+                              Temporarily act as the custodian so you can test the exact customer handoff end to end.
+                            </p>
+                          </div>
+                          <button
+                            className="secondary"
+                            onClick={() => setCustodianOpen((current) => !current)}
+                            disabled={busy === "custodian"}
+                          >
+                            {custodianOpen ? "Hide setup" : "Open test custodian"}
+                          </button>
+                        </div>
+
+                        {custodianOpen && (
+                          <div className="test-custodian-body">
+                            <div className="testnet-safety-note">
+                              <WarningIcon />
+                              <span>
+                                Testnet only. Use a disposable wallet. This creates real delegation proofs and broadcasts real transactions to the Stage vote chain, but it does not move or spend ZEC.
+                              </span>
+                            </div>
+
+                            <div className="custodian-field-grid">
+                              <label className="field-label">
+                                Wallet birthday height
+                                <input
+                                  type="number"
+                                  min={280000}
+                                  max={workspace.round.snapshotHeight}
+                                  step={1}
+                                  value={custodianBirthdayHeight}
+                                  onChange={(event) => {
+                                    setCustodianBirthdayHeight(event.target.value);
+                                    setCustodianResult(null);
+                                  }}
+                                  placeholder={`At or before ${workspace.round.snapshotHeight}`}
+                                  disabled={busy === "custodian"}
+                                />
+                                <small>
+                                  First block the wallet should scan. Use a height before its earliest transaction. ZIP 32 account 0 is used automatically.
+                                </small>
+                              </label>
+
+                              <label className="field-label">
+                                Testnet lightwalletd
+                                <input
+                                  type="url"
+                                  value={lightwalletdUrl}
+                                  onChange={(event) => setLightwalletdUrl(event.target.value)}
+                                  spellCheck={false}
+                                  disabled={busy === "custodian"}
+                                />
+                              </label>
+                            </div>
+
+                            <label className="field-label mnemonic-field">
+                              Testnet wallet mnemonic
+                              <span className="secret-input">
+                                <input
+                                  type={showCustodianMnemonic ? "text" : "password"}
+                                  value={custodianMnemonic}
+                                  onChange={(event) => setCustodianMnemonic(event.target.value)}
+                                  placeholder="12, 15, 18, 21, or 24 words"
+                                  autoComplete="off"
+                                  spellCheck={false}
+                                  disabled={busy === "custodian"}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => setShowCustodianMnemonic((current) => !current)}
+                                  aria-label={showCustodianMnemonic ? "Hide mnemonic" : "Show mnemonic"}
+                                >
+                                  {showCustodianMnemonic ? "Hide" : "Show"}
+                                </button>
+                              </span>
+                              <small>
+                                Used to recover and sign with account 0, then cleared. It is never written to disk or included in the customer payload.
+                              </small>
+                            </label>
+
+                            <label className="custodian-acknowledgement">
+                              <input
+                                type="checkbox"
+                                checked={custodianAcknowledged}
+                                onChange={(event) => setCustodianAcknowledged(event.target.checked)}
+                                disabled={busy === "custodian"}
+                              />
+                              <span><CheckIcon /></span>
+                              I am using a disposable Testnet wallet and understand this will broadcast to the Stage vote chain.
+                            </label>
+
+                            {busy === "custodian" && custodianProgress && (
+                              <div className="custodian-progress">
+                                <div>
+                                  <Spinner />
+                                  <span>
+                                    <strong>{custodianProgress.message}</strong>
+                                    {custodianProgress.bundleIndex !== null && (
+                                      <small>
+                                        Bundle {custodianProgress.bundleIndex + 1}
+                                        {custodianProgress.bundleCount !== null ? ` of ${custodianProgress.bundleCount}` : ""}
+                                      </small>
+                                    )}
+                                  </span>
+                                </div>
+                                <div className={`progress-track ${custodianProgress.progress === null ? "indeterminate" : ""}`}>
+                                  <span style={custodianProgress.progress === null ? undefined : { width: `${custodianProgress.progress * 100}%` }} />
+                                </div>
+                                <p>Keep the app open. The first proof can take several minutes.</p>
+                              </div>
+                            )}
+
+                            <div className="button-row custodian-actions">
+                              <span>
+                                The app creates an isolated wallet, syncs it to the round snapshot, and removes it after signing.
+                              </span>
+                              <button
+                                className="primary"
+                                onClick={() => void generateTestnetPayload()}
+                                disabled={!canRunTestCustodian || Boolean(busy)}
+                              >
+                                {busy === "custodian" ? <Spinner /> : <ShieldIcon />}
+                                Recover, build, and broadcast
+                              </button>
+                            </div>
+
+                            {custodianResult && (
+                              <div className="custodian-result">
+                                <CheckIcon />
+                                <span>
+                                  <strong>Exact custody payload generated</strong>
+                                  <small>{custodianResult.bundleCount} bundle{custodianResult.bundleCount === 1 ? "" : "s"} · SHA-256 {shortId(custodianResult.digest)}</small>
+                                </span>
+                                <button
+                                  className="secondary"
+                                  onClick={() => downloadText(capabilityFilename ?? "testnet-custody-capability.json", custodianResult.capabilityJson)}
+                                >
+                                  <DownloadIcon /> Download
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {profile === "testnet" && <div className="handoff-divider"><span>or import the provider handoff</span></div>}
                     <label className="file-drop">
                       <UploadIcon />
                       <strong>{capabilityFilename ?? "Choose the custodian JSON file"}</strong>
@@ -1010,6 +1243,7 @@ const InboxIcon = () => <Icon><path d="M4 4h16v16H4z" /><path d="m4 13 4-4h8l4 4
 const ChainIcon = () => <Icon><path d="m9 15-2 2a3 3 0 1 1-4-4l3-3a3 3 0 0 1 4 0" /><path d="m15 9 2-2a3 3 0 1 1 4 4l-3 3a3 3 0 0 1-4 0" /><path d="m8 16 8-8" /></Icon>;
 const BallotIcon = () => <Icon><path d="M6 3h12v18H6z" /><path d="M9 7h6" /><path d="M9 11h6" /><path d="M9 15h3" /></Icon>;
 const ArrowIcon = () => <Icon><path d="M5 12h14" /><path d="m14 7 5 5-5 5" /></Icon>;
+const WalletIcon = () => <Icon><path d="M4 7.5h15a2 2 0 0 1 2 2v9.5H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h13" /><path d="M17 12h4" /><circle cx="17" cy="14" r=".5" fill="currentColor" stroke="none" /></Icon>;
 
 function Spinner() {
   return <span className="spinner" aria-label="Loading" />;

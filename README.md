@@ -32,6 +32,30 @@ The demo uses the production capability parser, voting database, Merkle witnesse
 
 To clear the rehearsal, select **Reset local demo** in the sidebar. This removes only the Local Demo database and demo hotkey.
 
+## Test the custody handoff with a real Testnet wallet
+
+The Testnet profile includes an intentionally separate **local integration harness**. It lets a developer temporarily perform the custodian side of the protocol, broadcast the real delegation transactions to the Stage vote chain, and produce the exact canonical JSON that the customer workflow imports. The production customer flow remains unchanged and never asks for a wallet seed.
+
+You need:
+
+- an authenticated Testnet round whose status is **Active**;
+- a disposable Testnet wallet mnemonic whose ZIP-32 account 0 had at least one ballot of eligible Orchard weight at the round snapshot;
+- a wallet birthday block height at or before that account's earliest transaction; and
+- access to the configured Stage vote-chain and PIR services plus a Testnet lightwalletd endpoint.
+
+Then:
+
+1. Open **Testnet**, choose the active round, and select **Generate customer target**.
+2. Under **Import the custody payload**, open **Generate this payload with a real Testnet wallet**.
+3. Enter the account's wallet birthday height and mnemonic. ZIP-32 account 0 is selected automatically.
+4. Acknowledge the Testnet warning and select **Recover, build, and broadcast**. The app creates an isolated wallet database and syncs it through the round snapshot with the configured lightwalletd. The default endpoint is `https://testnet.zec.rocks:443` and can be changed in the form.
+5. Keep the app open while it syncs and creates the delegation proofs. The mnemonic is held only for this operation and cleared from the form afterward.
+6. When the exact payload is ready, it is placed in the normal customer import field. Select **Verify and import**, wait for confirmation if needed, choose each proposal response, and cast the vote.
+
+This broadcasts real governance transactions, but the synthetic delegation PCZT is not a spendable Zcash transaction and no Testnet ZEC is moved or consumed. Use a disposable Testnet wallet anyway because its mnemonic temporarily enters this development build.
+
+The operation is recoverable. Each scan batch is committed to the isolated wallet, and before broadcasting the app durably stores the exact signed vote-chain bytes and canonical capability. If it is interrupted, enter the same mnemonic and birthday and run the action again. Accepted bundles are detected or replayed byte-for-byte rather than rebuilt. The isolated wallet database is deleted once the signed capability is safely persisted; an incomplete database remains in the app's private data directory solely so the same job can resume.
+
 ## Customer workflow
 
 1. Choose the correct network and voting round.
@@ -53,8 +77,11 @@ Mainnet and Testnet are separate profiles with separate databases, manifests, an
 - Mainnet and Testnet service discovery begins from checksum-pinned static configuration. Dynamic configuration and round parameters are authenticated by `zcash_voting` before use.
 - Voting is blocked until every imported delegation has an on-chain VAN position.
 - Signed vote recovery is persisted before network submission, so an uncertain or interrupted submission can resume safely.
+- The Testnet custodian harness recovers ZIP-32 account 0 from a supplied mnemonic and birthday into a private SQLite database, syncs only through the authenticated round snapshot, and persists signed delegation bytes before broadcast.
 - HTTP responses are bounded while streaming. A helper share is recorded only after the configured helper redundancy target accepts it.
 - Recovery backups use passphrase-based age encryption and contain only voting state and voting hotkeys. They never contain custody funds, wallet seeds, or mnemonics.
+
+Test custodian jobs are deliberately excluded from customer recovery backups. They can contain privacy-sensitive recovered-wallet data and provider-side proof state, so use the harness only with disposable Testnet wallets and remove the app's local data when the rehearsal is no longer needed.
 
 See [SECURITY.md](SECURITY.md) and [docs/architecture.md](docs/architecture.md) for trust boundaries and recovery details.
 
@@ -73,6 +100,13 @@ The full proof smoke test is ignored during ordinary CI because it is CPU intens
 ```sh
 cd src-tauri
 cargo test demo::tests::demo_generates_and_confirms_a_real_vote_proof -- --ignored --exact
+```
+
+The live Testnet wallet-recovery smoke test is also opt-in:
+
+```sh
+cd src-tauri
+cargo test test_custodian::tests::recovers_account_zero_and_scans_real_testnet_blocks -- --ignored --exact
 ```
 
 ## Current scope

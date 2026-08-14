@@ -88,6 +88,23 @@ export interface ImportResult {
   pendingTransactionHashes: string[];
 }
 
+export interface TestCustodianResult {
+  capabilityJson: string;
+  digest: string;
+  bundleCount: number;
+  submittedBundleCount: number;
+  delegationTransactionHashes: string[];
+}
+
+export interface TestCustodianProgressEvent {
+  roundId: string;
+  phase: string;
+  bundleIndex: number | null;
+  bundleCount: number | null;
+  progress: number | null;
+  message: string;
+}
+
 export interface VoteChoice {
   proposalId: number;
   choice: number;

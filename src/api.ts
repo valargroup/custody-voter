@@ -8,6 +8,7 @@ import type {
   RoundCard,
   RoundWorkspace,
   TargetResult,
+  TestCustodianResult,
   VoteChoice,
 } from "./types";
 
@@ -35,6 +36,19 @@ export const api = {
     return invoke<ImportResult>("check_delegation_confirmations", {
       profile,
       roundId,
+    });
+  },
+  generateTestnetCustodyPayload(
+    roundId: string,
+    birthdayHeight: number,
+    mnemonic: string,
+    lightwalletdUrl: string,
+  ) {
+    return invoke<TestCustodianResult>("generate_testnet_custody_payload", {
+      roundId,
+      birthdayHeight,
+      mnemonic,
+      lightwalletdUrl,
     });
   },
   castVotes(profile: Profile, roundId: string, choices: VoteChoice[]) {

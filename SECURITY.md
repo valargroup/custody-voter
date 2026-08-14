@@ -13,6 +13,7 @@ The hotkey is stored in the operating-system credential store. The React UI rece
 - Human-readable proposal text and chain status come from an authenticated vote-chain endpoint. Customers should still verify the displayed network, round identifier, and selections before casting.
 - A custody capability is untrusted input until the strict importer validates its exact canonical bytes and all round and target bindings.
 - A recovery backup is untrusted input until age authentication, profile checks, SQLite integrity checks, and every hotkey-to-target binding succeed.
+- The Testnet custodian simulator is development-only. It temporarily crosses a wallet-seed boundary that the production customer workflow never crosses, and should be used only with disposable Testnet wallets.
 
 ## Recovery guarantees
 
@@ -21,12 +22,16 @@ The hotkey is stored in the operating-system credential store. The React UI rece
 - Repeating a vote action recovers the same persisted commitment when the choice matches; a conflicting choice is rejected.
 - Backup restoration validates all hotkeys before changing state, replaces only the selected profile, and rolls back Keychain changes if file activation fails.
 - Mainnet, Testnet, and Local Demo use distinct files, wallet identifiers, and Keychain services.
+- A Testnet custodian job derives only ZIP-32 account 0, creates an isolated wallet from the supplied birthday frontier, and syncs that wallet through the round snapshot. The mnemonic remains in zeroizing memory and is never persisted.
+- Signed delegation bytes are persisted before submission. Retrying with the same mnemonic and birthday checks for the same hash and rebroadcasts only the already-signed body.
+- The recovered wallet database is deleted after the signed capability is durably stored. If sync or proof generation is interrupted, it remains in the private app-data directory so the bound job can resume.
 
 ## Not in scope
 
 - The app cannot recover a forgotten backup passphrase.
 - It cannot protect a hotkey on a fully compromised customer computer.
 - It does not move, custody, or spend Zcash funds.
+- It does not make entering a valuable wallet mnemonic into a development build safe. The custodian simulator is Testnet-only by design and its provider-side job data is not included in customer backups.
 - Local development builds are not code signed or notarized for distribution.
 
 ## Reporting a vulnerability

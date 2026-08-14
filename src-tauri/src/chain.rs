@@ -11,6 +11,10 @@ use zcash_voting::{
         ResolveVotingConfigOptions, ResolvedVotingConfig,
     },
     confirmation::TxEvent,
+    pir::{
+        classify_pir_snapshot_height, select_pir_endpoint, PirSnapshotEndpointDiagnostic,
+        PirSnapshotEndpointStatus,
+    },
     validate_proposal_id, validate_round_params, validate_vote_options, MAX_PROPOSAL_ID,
 };
 
@@ -20,6 +24,7 @@ const MAINNET_CONFIG_SOURCE: &str = "https://raw.githubusercontent.com/valargrou
 const TESTNET_CONFIG_SOURCE: &str = "https://raw.githubusercontent.com/valargroup/token-holder-voting-config/491e55306aa5c539a0314d30a8b2c51946b88b73/stage/static-voting-config.json?checksum=sha256:80890a6de9acc7293c3e2fabf870bb3e5755dbe0e69de4a59feb8f696134d4dc";
 const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PIR_ROOT_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_RECENT_INACTIVE_ROUNDS: usize = 12;
 const MAX_ROUNDS_PER_RESPONSE: usize = 4_096;
 const MAX_TITLE_BYTES: usize = 512;
@@ -309,6 +314,91 @@ pub async fn submit_vote(
     post_vote_servers(client, servers, "/shielded-vote/v1/cast-vote", body).await
 }
 
+pub async fn submit_delegation(
+    client: &Client,
+    servers: &[ServiceEndpointView],
+    body: &str,
+) -> Result<BroadcastResult, String> {
+    post_vote_servers(client, servers, "/shielded-vote/v1/delegate-vote", body).await
+}
+
+pub async fn resolve_pir_endpoint(
+    client: &Client,
+    environment: &ResolvedVotingConfig,
+    snapshot_height: u64,
+) -> Result<String, String> {
+    let mut diagnostics = Vec::with_capacity(environment.pir_endpoints.len());
+    for endpoint in &environment.pir_endpoints {
+        let root_url = endpoint_url(&endpoint.url, "/root");
+        let diagnostic = match client.get(&root_url).send().await {
+            Ok(response) => {
+                let status = response.status();
+                match bounded_response(response, MAX_PIR_ROOT_RESPONSE_BYTES).await {
+                    Err(error) => PirSnapshotEndpointDiagnostic {
+                        endpoint: endpoint.url.clone(),
+                        status: PirSnapshotEndpointStatus::MalformedJson,
+                        reported_height: None,
+                        http_status_code: Some(status.as_u16()),
+                        message: Some(error),
+                    },
+                    Ok(bytes) if !status.is_success() => PirSnapshotEndpointDiagnostic {
+                        endpoint: endpoint.url.clone(),
+                        status: PirSnapshotEndpointStatus::NonSuccessStatus,
+                        reported_height: None,
+                        http_status_code: Some(status.as_u16()),
+                        message: Some(response_message(&bytes)),
+                    },
+                    Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(root) => match parse_pir_root_height(&root) {
+                            Ok(height) => classify_pir_snapshot_height(
+                                endpoint.url.clone(),
+                                snapshot_height,
+                                height,
+                            ),
+                            Err(message) => PirSnapshotEndpointDiagnostic {
+                                endpoint: endpoint.url.clone(),
+                                status: PirSnapshotEndpointStatus::MalformedJson,
+                                reported_height: None,
+                                http_status_code: Some(status.as_u16()),
+                                message: Some(message),
+                            },
+                        },
+                        Err(error) => PirSnapshotEndpointDiagnostic {
+                            endpoint: endpoint.url.clone(),
+                            status: PirSnapshotEndpointStatus::MalformedJson,
+                            reported_height: None,
+                            http_status_code: Some(status.as_u16()),
+                            message: Some(error.to_string()),
+                        },
+                    },
+                }
+            }
+            Err(error) => PirSnapshotEndpointDiagnostic {
+                endpoint: endpoint.url.clone(),
+                status: PirSnapshotEndpointStatus::TimeoutOrNetworkError,
+                reported_height: None,
+                http_status_code: None,
+                message: Some(error.to_string()),
+            },
+        };
+        diagnostics.push(diagnostic);
+    }
+
+    select_pir_endpoint(&diagnostics, snapshot_height, 0)
+        .map(|resolution| resolution.endpoint)
+        .map_err(|error| {
+            let summary = diagnostics
+                .iter()
+                .map(|diagnostic| match diagnostic.reported_height {
+                    Some(height) => format!("{}={height}", diagnostic.endpoint),
+                    None => format!("{}={:?}", diagnostic.endpoint, diagnostic.status),
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("resolve exact-height PIR endpoint failed: {error}. {summary}")
+        })
+}
+
 pub async fn submit_share(client: &Client, server_url: &str, body: &str) -> Result<(), String> {
     let url = endpoint_url(server_url, "/shielded-vote/v1/shares");
     let response = client
@@ -530,6 +620,27 @@ fn endpoint_url(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
+fn parse_pir_root_height(root: &Value) -> Result<Option<u64>, String> {
+    let Some(value) = root.get("height") else {
+        return Ok(None);
+    };
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| "PIR root height must be an unsigned integer".to_string()),
+        Value::String(value)
+            if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            value
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| "PIR root height is outside the u64 range".to_string())
+        }
+        _ => Err("PIR root height must be an unsigned integer or decimal string".to_string()),
+    }
+}
+
 fn decode_round_id(encoded: &str) -> Result<String, String> {
     let bytes = BASE64_STANDARD
         .decode(encoded.as_bytes())
@@ -663,5 +774,20 @@ mod tests {
         assert!(validate_tx_hash(&"AB".repeat(32)).is_ok());
         assert!(validate_tx_hash("../../unexpected").is_err());
         assert!(validate_tx_hash(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn pir_root_height_accepts_only_unsigned_integer_encodings() {
+        assert_eq!(parse_pir_root_height(&serde_json::json!({})).unwrap(), None);
+        assert_eq!(
+            parse_pir_root_height(&serde_json::json!({"height": 42})).unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            parse_pir_root_height(&serde_json::json!({"height": "42"})).unwrap(),
+            Some(42)
+        );
+        assert!(parse_pir_root_height(&serde_json::json!({"height": -1})).is_err());
+        assert!(parse_pir_root_height(&serde_json::json!({"height": " 42"})).is_err());
     }
 }
