@@ -1,0 +1,53 @@
+[package]
+name = "custody-voter"
+version = "0.1.0"
+description = "Customer application for custody-delegated Zcash voting"
+authors = ["Valar"]
+edition = "2021"
+repository = "https://github.com/valargroup/custody-voter"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "custody_voter_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2.5.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+age = "0.12.1"
+base64 = "0.22"
+bip0039 = "0.12"
+ff = "0.13"
+group = "0.13"
+hex = "0.4"
+keyring = "4.1.6"
+orchard = { version = "0.15", features = ["unstable-voting-circuits"] }
+pasta_curves = "0.5"
+prost = "0.14"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+secrecy = "0.8"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.14", features = ["channel", "tls-ring", "tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4"] }
+vote-commitment-tree = "=0.5.0-rc.1"
+zcash_client_backend = { version = "0.24.0-rc.7", default-features = false, features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard"] }
+zcash_client_sqlite = { version = "0.22.0-rc.7", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.16.1", features = ["orchard"] }
+zcash_protocol = "0.10.1"
+zcash_voting = "=3.0.0-rc.3"
+zeroize = "1"
+zip32 = "0.2"
