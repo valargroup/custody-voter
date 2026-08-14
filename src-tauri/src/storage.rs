@@ -557,13 +557,7 @@ pub fn restore_backup(
         restored_hotkeys.insert(hotkey.round_id.clone(), secret);
     }
 
-    let current_manifest = read_manifest(paths, profile)?;
-    let affected_rounds = current_manifest
-        .rounds
-        .keys()
-        .chain(envelope.manifest.rounds.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let affected_rounds = restore_rollback_round_ids(paths, profile, &envelope.manifest);
     let previous_hotkeys = capture_hotkeys(profile, &affected_rounds)?;
     let restore_result = (|| {
         for round_id in &affected_rounds {
@@ -591,6 +585,38 @@ pub fn restore_backup(
         round_count: u32::try_from(envelope.manifest.rounds.len())
             .map_err(|_| "restored round count exceeds u32".to_string())?,
     })
+}
+
+/// Collects every recoverable hotkey identifier without letting damaged local
+/// metadata block activation of an independently validated backup.
+fn restore_rollback_round_ids(
+    paths: &ProfilePaths,
+    profile: Profile,
+    restored_manifest: &ProfileManifest,
+) -> BTreeSet<String> {
+    let mut round_ids = restored_manifest
+        .rounds
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Ok(current_manifest) = read_manifest(paths, profile) {
+        round_ids.extend(current_manifest.rounds.keys().cloned());
+    }
+    round_ids.extend(database_round_ids_for_restore(paths, profile));
+    round_ids
+}
+
+/// Best-effort fallback for identifiers that a damaged manifest cannot provide.
+fn database_round_ids_for_restore(paths: &ProfilePaths, profile: Profile) -> Vec<String> {
+    if !paths.database.exists() {
+        return Vec::new();
+    }
+    let Ok(db) = open_db(paths, profile) else {
+        return Vec::new();
+    };
+    db.list_rounds()
+        .map(|rounds| rounds.into_iter().map(|round| round.round_id).collect())
+        .unwrap_or_default()
 }
 
 fn validate_backup_envelope(envelope: &BackupEnvelope, profile: Profile) -> Result<(), String> {
@@ -910,5 +936,34 @@ mod tests {
         assert_eq!(result.removed_profiles, 2);
         assert_eq!(result.removed_rounds, 0);
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn restore_rollback_scope_recovers_rounds_when_the_manifest_is_damaged() {
+        let root =
+            std::env::temp_dir().join(format!("custody-voter-damaged-manifest-{}", Uuid::new_v4()));
+        let paths = profile_paths(&root, Profile::Testnet).unwrap();
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        let wallet = db.wallet_id().to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO rounds (
+                    round_id, wallet_id, network, snapshot_height, ea_pk, nc_root,
+                    nullifier_imt_root, created_at
+                 ) VALUES ('recoverable-round', ?1, 'testnet', 1, X'00', X'00', X'00', 1)",
+                [&wallet],
+            )
+            .unwrap();
+        drop(db);
+        fs::write(&paths.manifest, b"{").unwrap();
+
+        let round_ids = restore_rollback_round_ids(
+            &paths,
+            Profile::Testnet,
+            &ProfileManifest::empty(Profile::Testnet),
+        );
+
+        assert_eq!(round_ids, BTreeSet::from(["recoverable-round".to_string()]));
+        fs::remove_dir_all(root).unwrap();
     }
 }

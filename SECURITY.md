@@ -20,7 +20,7 @@ The hotkey is stored in the operating-system credential store. The React UI rece
 - A target that already exists is never silently replaced if its Keychain hotkey is missing.
 - Vote proof and signature recovery data are persisted before broadcast.
 - Repeating a vote action recovers the same persisted commitment when the choice matches; a conflicting choice is rejected.
-- Backup restoration validates all hotkeys before changing state, replaces only the selected profile, and rolls back Keychain changes if file activation fails.
+- Backup restoration validates all hotkeys before changing state, replaces only the selected profile even when its local manifest is damaged, and rolls back Keychain changes if file activation fails.
 - Mainnet, Testnet, and Local Demo use distinct files, wallet identifiers, and Keychain services.
 - A Testnet custodian job derives only ZIP-32 account 0, creates an isolated wallet from the supplied birthday frontier, and syncs that wallet through the round snapshot. The mnemonic remains in zeroizing memory and is never persisted.
 - Signed delegation bytes are persisted before submission. Retrying with the same mnemonic and birthday checks for the same hash and rebroadcasts only the already-signed body.
