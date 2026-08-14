@@ -192,7 +192,9 @@ jobs:
             "$RELEASE_DIR/Custody-Voter-macos.dmg.sha256"
           )
           RELEASE_FLAGS=()
-          if [[ "$RELEASE_TAG" == *-* ]]; then
+          RELEASE_VERSION="${RELEASE_TAG#v}"
+          VERSION_WITHOUT_BUILD_METADATA="${RELEASE_VERSION%%+*}"
+          if [[ "$VERSION_WITHOUT_BUILD_METADATA" == *-* ]]; then
             RELEASE_FLAGS+=(--prerelease)
           fi
 
