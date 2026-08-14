@@ -187,6 +187,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          require_remote_tag_at_build_commit() {
+            local built_commit remote_commit
+
+            built_commit="$(git rev-parse HEAD)"
+            if ! git fetch --force --no-tags origin \
+              "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"; then
+              echo "Remote tag $RELEASE_TAG no longer exists; refusing to publish this build." >&2
+              exit 1
+            fi
+            remote_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [[ "$remote_commit" != "$built_commit" ]]; then
+              echo "Remote tag $RELEASE_TAG moved after checkout; refusing to publish this build." >&2
+              exit 1
+            fi
+          }
+
           ASSETS=(
             "$RELEASE_DIR/Custody-Voter-macos.dmg"
             "$RELEASE_DIR/Custody-Voter-macos.dmg.sha256"
@@ -197,6 +213,8 @@ jobs:
           if [[ "$VERSION_WITHOUT_BUILD_METADATA" == *-* ]]; then
             RELEASE_FLAGS+=(--prerelease)
           fi
+
+          require_remote_tag_at_build_commit
 
           if RELEASE_IS_DRAFT="$(
             gh release view "$RELEASE_TAG" \
@@ -228,6 +246,7 @@ jobs:
             --clobber \
             --repo "$GITHUB_REPOSITORY"
 
+          require_remote_tag_at_build_commit
           gh release edit "$RELEASE_TAG" \
             --draft=false \
             --repo "$GITHUB_REPOSITORY"
