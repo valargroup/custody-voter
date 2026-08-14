@@ -125,10 +125,57 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         Uuid::new_v4()
     ));
     fs::write(&temp, bytes).map_err(|error| format!("write temporary file failed: {error}"))?;
-    fs::rename(&temp, path).map_err(|error| {
+    replace_file(&temp, path).map_err(|error| {
         let _ = fs::remove_file(&temp);
         format!("replace file failed: {error}")
     })
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::{iter::once, os::windows::ffi::OsStrExt, ptr::null};
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if encoded.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains a NUL character",
+            ));
+        }
+        encoded.extend(once(0));
+        Ok(encoded)
+    }
+
+    let source_wide = wide_path(source)?;
+    let destination_wide = wide_path(destination)?;
+    // SAFETY: Both paths are NUL-terminated and remain alive for the call.
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            source_wide.as_ptr(),
+            null(),
+            0,
+            null(),
+            null(),
+        )
+    };
+    if replaced != 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        fs::rename(source, destination)
+    } else {
+        Err(error)
+    }
 }
 
 fn keyring_entry(profile: Profile, round_id: &str) -> Result<Entry, String> {
@@ -897,6 +944,20 @@ fn to_u64(value: i64, field: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_replaces_an_existing_file() {
+        let directory =
+            std::env::temp_dir().join(format!("custody-voter-atomic-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("manifest.json");
+
+        atomic_write(&path, b"first").unwrap();
+        atomic_write(&path, b"replacement").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn age_backup_encryption_round_trips_and_rejects_wrong_password() {

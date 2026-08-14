@@ -1169,6 +1169,7 @@ dependencies = [
  "tonic",
  "uuid",
  "vote-commitment-tree",
+ "windows-sys 0.61.2",
  "zcash_client_backend",
  "zcash_client_sqlite",
  "zcash_keys",
