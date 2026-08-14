@@ -205,7 +205,14 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               2>/dev/null
           )"; then
-            :
+            if [[ "$RELEASE_IS_DRAFT" == "false" ]]; then
+              echo "Release $RELEASE_TAG is already published; leaving its assets unchanged."
+              exit 0
+            fi
+            if [[ "$RELEASE_IS_DRAFT" != "true" ]]; then
+              echo "GitHub returned an unexpected draft state for $RELEASE_TAG." >&2
+              exit 1
+            fi
           else
             gh release create "$RELEASE_TAG" \
               --draft \
@@ -214,7 +221,6 @@ jobs:
               --title "Zcash Custody Voter $RELEASE_TAG" \
               --verify-tag \
               --repo "$GITHUB_REPOSITORY"
-            RELEASE_IS_DRAFT=true
           fi
 
           gh release upload "$RELEASE_TAG" \
@@ -222,11 +228,9 @@ jobs:
             --clobber \
             --repo "$GITHUB_REPOSITORY"
 
-          if [[ "$RELEASE_IS_DRAFT" == "true" ]]; then
-            gh release edit "$RELEASE_TAG" \
-              --draft=false \
-              --repo "$GITHUB_REPOSITORY"
-          fi
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
+            --repo "$GITHUB_REPOSITORY"
 
       - name: Remove temporary signing material
         if: always()

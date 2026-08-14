@@ -120,7 +120,7 @@ The `Signed macOS release` GitHub Actions workflow builds the exact commit named
 - `Custody-Voter-macos.dmg`
 - `Custody-Voter-macos.dmg.sha256`
 
-Pushing a tag such as `v1.0.1` starts the workflow. The tag must exactly match `v` plus the version in `src-tauri/tauri.conf.json`. Versions with a prerelease suffix are published as prereleases, and the workflow leaves GitHub to determine which stable release is latest. Assets are uploaded to a draft first and the release is published only after both uploads succeed, so rerunning the workflow can recover an interrupted publication. The manual workflow input can rebuild an existing matching version tag without moving it. Release-asset visibility follows the repository's GitHub visibility.
+Pushing a tag such as `v1.0.1` starts the workflow. The tag must exactly match `v` plus the version in `src-tauri/tauri.conf.json`. Versions with a prerelease suffix are published as prereleases, and the workflow leaves GitHub to determine which stable release is latest. Assets are uploaded to a draft first and the release is published only after both uploads succeed, so the manual workflow input can resume an interrupted draft for an existing matching version tag. Already-published releases and their assets are left unchanged. Release-asset visibility follows the repository's GitHub visibility.
 
 The workflow requires these encrypted Actions secrets:
 
