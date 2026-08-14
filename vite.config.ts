@@ -7,14 +7,15 @@ const host = tauriEnvironment.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async ({ command }) => {
-  const localDemoEnabled =
+  const developmentToolsEnabled =
     tauriEnvironment.TAURI_ENV_DEBUG === "true" ||
     (tauriEnvironment.TAURI_ENV_DEBUG === undefined && command === "serve");
 
   return {
     plugins: [react()],
     define: {
-      __LOCAL_DEMO_ENABLED__: JSON.stringify(localDemoEnabled),
+      __LOCAL_DEMO_ENABLED__: JSON.stringify(developmentToolsEnabled),
+      __TEST_CUSTODIAN_ENABLED__: JSON.stringify(developmentToolsEnabled),
     },
 
     // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

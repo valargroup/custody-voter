@@ -157,6 +157,7 @@ pub struct ImportResult {
     pub pending_transaction_hashes: Vec<String>,
 }
 
+#[cfg(debug_assertions)]
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TestCustodianResult {
@@ -167,6 +168,7 @@ pub struct TestCustodianResult {
     pub delegation_transaction_hashes: Vec<String>,
 }
 
+#[cfg(debug_assertions)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestCustodianProgressEvent {

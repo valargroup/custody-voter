@@ -5,16 +5,17 @@ use reqwest::{header, Client, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::sleep;
+#[cfg(debug_assertions)]
+use zcash_voting::pir::{
+    classify_pir_snapshot_height, select_pir_endpoint, PirSnapshotEndpointDiagnostic,
+    PirSnapshotEndpointStatus,
+};
 use zcash_voting::{
     config::{
         resolve_dynamic_voting_config, resolve_static_voting_config, PinnedConfigSource,
         ResolveVotingConfigOptions, ResolvedVotingConfig,
     },
     confirmation::TxEvent,
-    pir::{
-        classify_pir_snapshot_height, select_pir_endpoint, PirSnapshotEndpointDiagnostic,
-        PirSnapshotEndpointStatus,
-    },
     validate_proposal_id, validate_round_params, validate_vote_options, MAX_PROPOSAL_ID,
 };
 
@@ -24,6 +25,7 @@ const MAINNET_CONFIG_SOURCE: &str = "https://raw.githubusercontent.com/valargrou
 const TESTNET_CONFIG_SOURCE: &str = "https://raw.githubusercontent.com/valargroup/token-holder-voting-config/491e55306aa5c539a0314d30a8b2c51946b88b73/stage/static-voting-config.json?checksum=sha256:80890a6de9acc7293c3e2fabf870bb3e5755dbe0e69de4a59feb8f696134d4dc";
 const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(debug_assertions)]
 const MAX_PIR_ROOT_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_RECENT_INACTIVE_ROUNDS: usize = 12;
 const MAX_ROUNDS_PER_RESPONSE: usize = 4_096;
@@ -314,6 +316,7 @@ pub async fn submit_vote(
     post_vote_servers(client, servers, "/shielded-vote/v1/cast-vote", body).await
 }
 
+#[cfg(debug_assertions)]
 pub async fn submit_delegation(
     client: &Client,
     servers: &[ServiceEndpointView],
@@ -322,6 +325,7 @@ pub async fn submit_delegation(
     post_vote_servers(client, servers, "/shielded-vote/v1/delegate-vote", body).await
 }
 
+#[cfg(debug_assertions)]
 pub async fn resolve_pir_endpoint(
     client: &Client,
     environment: &ResolvedVotingConfig,
@@ -620,6 +624,7 @@ fn endpoint_url(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
+#[cfg(any(debug_assertions, test))]
 fn parse_pir_root_height(root: &Value) -> Result<Option<u64>, String> {
     let Some(value) = root.get("height") else {
         return Ok(None);

@@ -94,6 +94,7 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!__TEST_CUSTODIAN_ENABLED__) return;
     let unlisten: (() => void) | undefined;
     void listen<TestCustodianProgressEvent>("custodian-progress", ({ payload }) => {
       if (payload.roundId === selectedRef.current) setCustodianProgress(payload);
@@ -249,7 +250,7 @@ function App() {
   };
 
   const generateTestnetPayload = async () => {
-    if (!workspace) return;
+    if (!__TEST_CUSTODIAN_ENABLED__ || !workspace) return;
     const birthdayHeight = Number(custodianBirthdayHeight);
     if (!Number.isSafeInteger(birthdayHeight)) return;
     setCustodianProgress({
@@ -497,6 +498,7 @@ function App() {
   );
   const custodianBirthday = Number(custodianBirthdayHeight);
   const canRunTestCustodian = Boolean(
+    __TEST_CUSTODIAN_ENABLED__ &&
     workspace &&
       Number.isSafeInteger(custodianBirthday) &&
       custodianBirthday > 0 &&
@@ -805,7 +807,7 @@ function App() {
                   </div>
                 ) : (
                   <>
-                    {profile === "testnet" && (
+                    {__TEST_CUSTODIAN_ENABLED__ && profile === "testnet" && (
                       <div className={`test-custodian ${custodianOpen ? "open" : ""}`}>
                         <div className="test-custodian-heading">
                           <div className="test-custodian-icon"><WalletIcon /></div>
@@ -958,7 +960,9 @@ function App() {
                       </div>
                     )}
 
-                    {profile === "testnet" && <div className="handoff-divider"><span>or import the provider handoff</span></div>}
+                    {__TEST_CUSTODIAN_ENABLED__ && profile === "testnet" && (
+                      <div className="handoff-divider"><span>or import the provider handoff</span></div>
+                    )}
                     <label className="file-drop">
                       <UploadIcon />
                       <strong>{capabilityFilename ?? "Choose the custodian JSON file"}</strong>

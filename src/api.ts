@@ -45,6 +45,9 @@ export const api = {
     mnemonic: string,
     lightwalletdUrl: string,
   ) {
+    if (!__TEST_CUSTODIAN_ENABLED__) {
+      return Promise.reject(new Error("The Testnet custodian simulator is unavailable in release builds."));
+    }
     return invoke<TestCustodianResult>("generate_testnet_custody_payload", {
       roundId,
       birthdayHeight,

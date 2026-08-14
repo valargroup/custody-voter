@@ -2,14 +2,17 @@ mod chain;
 mod demo;
 mod model;
 mod storage;
+#[cfg(debug_assertions)]
 mod test_custodian;
 mod voter;
 
 use std::{collections::HashSet, fs, path::PathBuf};
 
+#[cfg(debug_assertions)]
+use model::TestCustodianResult;
 use model::{
     BackupResult, CastVotesResult, ImportResult, Profile, ResetResult, RestoreResult, RoundCard,
-    RoundWorkspace, TargetResult, TestCustodianResult, VoteChoiceInput,
+    RoundWorkspace, TargetResult, VoteChoiceInput,
 };
 use reqwest::Client;
 use storage::{profile_paths, read_manifest, round_progress, vote_records};
@@ -151,6 +154,7 @@ async fn check_delegation_confirmations(
     voter::refresh_delegations(&state.client, &paths, profile, &round).await
 }
 
+#[cfg(debug_assertions)]
 #[tauri::command]
 async fn generate_testnet_custody_payload(
     app: tauri::AppHandle,
@@ -246,7 +250,7 @@ async fn reset_all_data(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir().map_err(|error| {
@@ -260,21 +264,37 @@ pub fn run() {
                 reset_token: Mutex::new(None),
             });
             Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            list_rounds,
-            get_round_workspace,
-            generate_target,
-            generate_demo_capability,
-            import_capability,
-            check_delegation_confirmations,
-            generate_testnet_custody_payload,
-            cast_votes,
-            export_backup,
-            restore_backup,
-            prepare_reset,
-            reset_all_data,
-        ])
+        });
+    #[cfg(debug_assertions)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        list_rounds,
+        get_round_workspace,
+        generate_target,
+        generate_demo_capability,
+        import_capability,
+        check_delegation_confirmations,
+        generate_testnet_custody_payload,
+        cast_votes,
+        export_backup,
+        restore_backup,
+        prepare_reset,
+        reset_all_data,
+    ]);
+    #[cfg(not(debug_assertions))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        list_rounds,
+        get_round_workspace,
+        generate_target,
+        generate_demo_capability,
+        import_capability,
+        check_delegation_confirmations,
+        cast_votes,
+        export_backup,
+        restore_backup,
+        prepare_reset,
+        reset_all_data,
+    ]);
+    builder
         .run(tauri::generate_context!())
         .expect("error while running Zcash Custody Voter");
 }

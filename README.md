@@ -6,7 +6,7 @@ The app supports Mainnet and Testnet. Development and debug builds also include 
 
 ## Build instruction for AI agents
 
-When asked to build the application, produce a production-optimized release build by default with `npm run tauri build`. A development server, frontend-only build, or Tauri debug build does not satisfy an unqualified build request. Use a debug build only when the requester explicitly asks for one, and confirm that the completed app bundle came from `src-tauri/target/release/bundle`, not `src-tauri/target/debug/bundle`. Production release builds omit the Local Demo selector.
+When asked to build the application, produce a production-optimized release build by default with `npm run tauri build`. A development server, frontend-only build, or Tauri debug build does not satisfy an unqualified build request. Use a debug build only when the requester explicitly asks for one, and confirm that the completed app bundle came from `src-tauri/target/release/bundle`, not `src-tauri/target/debug/bundle`. Production release builds omit the Local Demo selector and the Testnet custodian simulator, including its native provider-side implementation.
 
 ## Try the complete flow locally
 
@@ -38,7 +38,7 @@ To clear the rehearsal, select **Reset local demo** in the sidebar. This removes
 
 ## Test the custody handoff with a real Testnet wallet
 
-The Testnet profile includes an intentionally separate **local integration harness**. It lets a developer temporarily perform the custodian side of the protocol, broadcast the real delegation transactions to the Stage vote chain, and produce the exact canonical JSON that the customer workflow imports. The production customer flow remains unchanged and never asks for a wallet seed.
+Development and debug builds include an intentionally separate **local integration harness** in the Testnet profile. It lets a developer temporarily perform the custodian side of the protocol, broadcast the real delegation transactions to the Stage vote chain, and produce the exact canonical JSON that the customer workflow imports. Production release builds exclude both the harness UI and its native implementation, so the customer flow never asks for a wallet seed.
 
 You need:
 
@@ -81,7 +81,7 @@ Mainnet and Testnet are separate profiles with separate databases, manifests, an
 - Mainnet and Testnet service discovery begins from checksum-pinned static configuration. Dynamic configuration and round parameters are authenticated by `zcash_voting` before use.
 - Voting is blocked until every imported delegation has an on-chain VAN position.
 - Signed vote recovery is persisted before network submission, so an uncertain or interrupted submission can resume safely.
-- The Testnet custodian harness recovers ZIP-32 account 0 from a supplied mnemonic and birthday into a private SQLite database, syncs only through the authenticated round snapshot, and persists signed delegation bytes before broadcast.
+- Development and debug builds include a Testnet custodian harness that recovers ZIP-32 account 0 from a supplied mnemonic and birthday into a private SQLite database, syncs only through the authenticated round snapshot, and persists signed delegation bytes before broadcast. The harness is excluded from production release builds.
 - HTTP responses are bounded while streaming. A helper share is recorded only after the configured helper redundancy target accepts it.
 - Recovery backups use passphrase-based age encryption and contain only voting state and voting hotkeys. They never contain custody funds, wallet seeds, or mnemonics.
 
