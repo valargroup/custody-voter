@@ -15,11 +15,13 @@ use reqwest::Client;
 use storage::{profile_paths, read_manifest, round_progress, vote_records};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 struct AppState {
     app_data_dir: PathBuf,
     client: Client,
     operation_lock: Mutex<()>,
+    reset_token: Mutex<Option<String>>,
 }
 
 #[tauri::command]
@@ -220,26 +222,32 @@ async fn restore_backup(
 }
 
 #[tauri::command]
-async fn reset_demo(state: State<'_, AppState>) -> Result<ResetResult, String> {
+async fn prepare_reset(state: State<'_, AppState>) -> Result<String, String> {
+    let token = Uuid::new_v4().to_string();
+    *state.reset_token.lock().await = Some(token.clone());
+    Ok(token)
+}
+
+#[tauri::command]
+async fn reset_all_data(
+    confirmation_token: String,
+    state: State<'_, AppState>,
+) -> Result<ResetResult, String> {
     let _guard = state.operation_lock.lock().await;
-    let paths = profile_paths(&state.app_data_dir, Profile::Demo)?;
-    let manifest = read_manifest(&paths, Profile::Demo)?;
-    for round_id in manifest.rounds.keys() {
-        storage::delete_hotkey(Profile::Demo, round_id)?;
+    if state.reset_token.lock().await.as_deref() != Some(confirmation_token.as_str()) {
+        return Err("reset confirmation is missing or expired".to_string());
     }
-    if paths.directory.exists() {
-        fs::remove_dir_all(&paths.directory)
-            .map_err(|error| format!("remove local demo data failed: {error}"))?;
+    let result = storage::reset_all_data(&state.app_data_dir);
+    if result.is_ok() {
+        state.reset_token.lock().await.take();
     }
-    Ok(ResetResult {
-        removed_rounds: u32::try_from(manifest.rounds.len())
-            .map_err(|_| "demo round count exceeds u32".to_string())?,
-    })
+    result
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir().map_err(|error| {
                 std::io::Error::other(format!("resolve app data directory failed: {error}"))
@@ -249,6 +257,7 @@ pub fn run() {
                 app_data_dir,
                 client: chain::http_client().map_err(std::io::Error::other)?,
                 operation_lock: Mutex::new(()),
+                reset_token: Mutex::new(None),
             });
             Ok(())
         })
@@ -263,7 +272,8 @@ pub fn run() {
             cast_votes,
             export_backup,
             restore_backup,
-            reset_demo,
+            prepare_reset,
+            reset_all_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Zcash Custody Voter");

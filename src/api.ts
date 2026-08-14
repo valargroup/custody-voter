@@ -5,6 +5,7 @@ import type {
   ImportResult,
   Profile,
   RestoreResult,
+  ResetResult,
   RoundCard,
   RoundWorkspace,
   TargetResult,
@@ -68,8 +69,11 @@ export const api = {
       encryptedBytes: Array.from(bytes),
     });
   },
-  resetDemo() {
-    return invoke<{ removedRounds: number }>("reset_demo");
+  prepareReset() {
+    return invoke<string>("prepare_reset");
+  },
+  resetAllData(confirmationToken: string) {
+    return invoke<ResetResult>("reset_all_data", { confirmationToken });
   },
 };
 

@@ -2,7 +2,11 @@
 
 Zcash Custody Voter is the customer-side application for custody-delegated Zcash voting. A custodian keeps control of the customer's funds while the customer creates and controls a separate voting hotkey, imports the custodian's delegation capability, and casts private votes.
 
-The app supports Mainnet, Testnet, and a self-contained Local Demo. It is a Tauri desktop application so voting secrets and proof generation remain in native Rust rather than browser storage or JavaScript.
+The app supports Mainnet and Testnet. Development and debug builds also include a self-contained Local Demo. It is a Tauri desktop application so voting secrets and proof generation remain in native Rust rather than browser storage or JavaScript.
+
+## Build instruction for AI agents
+
+When asked to build the application, produce a production-optimized release build by default with `npm run tauri build`. A development server, frontend-only build, or Tauri debug build does not satisfy an unqualified build request. Use a debug build only when the requester explicitly asks for one, and confirm that the completed app bundle came from `src-tauri/target/release/bundle`, not `src-tauri/target/debug/bundle`. Production release builds omit the Local Demo selector.
 
 ## Try the complete flow locally
 
@@ -67,7 +71,7 @@ The operation is recoverable. Each scan batch is committed to the isolated walle
 7. Review the network, round, and one selection per proposal.
 8. Generate, sign, submit, and confirm the votes. If the app is interrupted, start the same action again to recover the persisted signed vote instead of producing a conflicting one.
 
-Mainnet and Testnet are separate profiles with separate databases, manifests, and Keychain namespaces. The UI defaults to Local Demo and gives Mainnet a persistent production warning.
+Mainnet and Testnet are separate profiles with separate databases, manifests, and Keychain namespaces. Development and debug builds default to Local Demo. Production release builds omit that selector and default to Testnet. Mainnet always has a persistent production warning.
 
 ## Security model
 

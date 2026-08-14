@@ -53,6 +53,8 @@ export interface RoundProgress {
   voteCount: number;
   submittedVoteCount: number;
   confirmedVoteCount: number;
+  requiredShareCount: number;
+  submittedShareCount: number;
 }
 
 export interface RoundCard extends RoundSnapshot {
@@ -141,4 +143,9 @@ export interface BackupResult {
 export interface RestoreResult {
   profile: Profile;
   roundCount: number;
+}
+
+export interface ResetResult {
+  removedProfiles: number;
+  removedRounds: number;
 }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, errorMessage } from "./api";
 import type {
   CastVotesResult,
@@ -14,12 +15,18 @@ import appIconUrl from "../src-tauri/icons/icon.png";
 import "./App.css";
 
 const DEFAULT_TESTNET_LIGHTWALLETD = "https://testnet.zec.rocks:443";
+const TESTNET_TRANSACTION_RPC = "https://stage.explorer-rpc.valargroup.org/tx";
+const MAINNET_TRANSACTION_RPC = "https://explorer-rpc.valargroup.org/tx";
 
-const PROFILES: Array<{ id: Profile; label: string; eyebrow: string }> = [
+const ALL_PROFILES: Array<{ id: Profile; label: string; eyebrow: string }> = [
   { id: "demo", label: "Local Demo", eyebrow: "Offline rehearsal" },
   { id: "testnet", label: "Testnet", eyebrow: "Stage vote chain" },
   { id: "mainnet", label: "Mainnet", eyebrow: "Production" },
 ];
+const PROFILES = ALL_PROFILES.filter(
+  (item) => __LOCAL_DEMO_ENABLED__ || item.id !== "demo",
+);
+const DEFAULT_PROFILE: Profile = __LOCAL_DEMO_ENABLED__ ? "demo" : "testnet";
 
 type BusyAction =
   | "rounds"
@@ -31,14 +38,16 @@ type BusyAction =
   | "vote"
   | "backup"
   | "restore"
+  | "prepare-reset"
   | "reset"
   | null;
 
 type BackupMode = "export" | "restore" | null;
 
 function App() {
-  const [profile, setProfile] = useState<Profile>("demo");
+  const [profile, setProfile] = useState<Profile>(DEFAULT_PROFILE);
   const [rounds, setRounds] = useState<RoundCard[]>([]);
+  const [inactiveRoundsOpen, setInactiveRoundsOpen] = useState(false);
   const [selectedRoundId, setSelectedRoundId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<RoundWorkspace | null>(null);
   const [busy, setBusy] = useState<BusyAction>(null);
@@ -51,6 +60,10 @@ function App() {
   const [reviewed, setReviewed] = useState(false);
   const [voteProgress, setVoteProgress] = useState<VoteProgressEvent | null>(null);
   const [voteResult, setVoteResult] = useState<CastVotesResult | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [resetAcknowledged, setResetAcknowledged] = useState(false);
+  const [resetToken, setResetToken] = useState<string | null>(null);
   const [backupMode, setBackupMode] = useState<BackupMode>(null);
   const [passphrase, setPassphrase] = useState("");
   const [confirmPassphrase, setConfirmPassphrase] = useState("");
@@ -127,7 +140,12 @@ function App() {
         const preferred = preferredRoundId
           ? next.find((round) => round.roundId === preferredRoundId)
           : undefined;
-        const selected = preferred ?? next.find((round) => round.stored) ?? next[0];
+        const selected =
+          preferred ??
+          next.find((round) => round.isActive && round.stored) ??
+          next.find((round) => round.isActive) ??
+          next.find((round) => round.stored) ??
+          next[0];
         setSelectedRoundId(selected?.roundId ?? null);
         if (selected) {
           await loadWorkspace(selected.roundId, currentProfile);
@@ -148,6 +166,7 @@ function App() {
   );
 
   useEffect(() => {
+    setInactiveRoundsOpen(false);
     setRounds([]);
     setSelectedRoundId(null);
     setWorkspace(null);
@@ -366,12 +385,52 @@ function App() {
     setRestoreFilename(null);
   };
 
-  const resetDemo = async () => {
-    if (!window.confirm("Remove the local demo database and its demo hotkey from Keychain?")) return;
-    const result = await runAction("reset", () => api.resetDemo());
+  const openBackupFromSettings = (mode: Exclude<BackupMode, null>) => {
+    setSettingsOpen(false);
+    setBackupMode(mode);
+  };
+
+  const openResetConfirmation = async () => {
+    const token = await runAction("prepare-reset", () => api.prepareReset());
+    if (!token) return;
+    setSettingsOpen(false);
+    setResetAcknowledged(false);
+    setResetToken(token);
+    setResetConfirmOpen(true);
+  };
+
+  const closeResetConfirmation = (returnToSettings = false) => {
+    if (busy === "reset") return;
+    setResetConfirmOpen(false);
+    setResetAcknowledged(false);
+    setResetToken(null);
+    if (returnToSettings) setSettingsOpen(true);
+  };
+
+  const resetAllData = async () => {
+    if (!resetAcknowledged || !resetToken) return;
+    const result = await runAction("reset", () => api.resetAllData(resetToken));
     if (!result) return;
-    await loadRounds("demo");
-    setNotice("Local demo state was removed. You can start a clean rehearsal now.");
+    setResetConfirmOpen(false);
+    setResetAcknowledged(false);
+    setResetToken(null);
+    roundsRequestRef.current += 1;
+    workspaceRequestRef.current += 1;
+    setRounds([]);
+    setSelectedRoundId(null);
+    setWorkspace(null);
+    setCapabilityText("");
+    setCapabilityBytes(null);
+    setCapabilityFilename(null);
+    setChoices({});
+    setReviewed(false);
+    setVoteProgress(null);
+    setVoteResult(null);
+    resetCustodianForm();
+    await loadRounds(profile);
+    setNotice(
+      `Removed ${result.removedRounds} stored round${result.removedRounds === 1 ? "" : "s"} across ${result.removedProfiles} local profile${result.removedProfiles === 1 ? "" : "s"}.`,
+    );
   };
 
   const completeChoiceCount = workspace
@@ -382,16 +441,52 @@ function App() {
       workspace.progress.bundleCount > 0 &&
       workspace.progress.bundleCount === workspace.progress.confirmedBundleCount,
   );
+  const expectedVoteCount = workspace
+    ? workspace.progress.bundleCount * workspace.round.proposals.length
+    : 0;
+  const votesConfirmed = Boolean(
+    workspace &&
+      expectedVoteCount > 0 &&
+      workspace.progress.confirmedVoteCount >= expectedVoteCount,
+  );
+  const helperSharesDelivered = Boolean(
+    workspace &&
+      (profile === "demo" ||
+        (workspace.progress.requiredShareCount > 0 &&
+          workspace.progress.submittedShareCount >= workspace.progress.requiredShareCount)),
+  );
+  const voteComplete = votesConfirmed && helperSharesDelivered;
   const voteReady = Boolean(
     workspace &&
       delegationReady &&
       completeChoiceCount === workspace.round.proposals.length &&
       reviewed &&
+      !voteComplete &&
       (workspace.round.isActive || profile === "demo"),
   );
-  const expectedVoteCount = workspace
-    ? workspace.progress.bundleCount * workspace.round.proposals.length
-    : 0;
+  const voteActionLabel = workspace?.progress.voteCount
+    ? workspace.progress.confirmedVoteCount < expectedVoteCount
+      ? workspace.progress.submittedVoteCount < expectedVoteCount
+        ? "Resume vote submission"
+        : "Resume and confirm vote"
+      : "Finish helper share delivery"
+    : profile === "demo"
+      ? "Run local proof rehearsal"
+      : "Generate proofs and cast vote";
+  const receiptTransactions =
+    voteResult?.transactions ??
+    workspace?.votes.flatMap((vote) =>
+      vote.txHash
+        ? [{ bundleIndex: vote.bundleIndex, proposalId: vote.proposalId, txHash: vote.txHash }]
+        : [],
+    ) ??
+    [];
+  const openTransaction = (txHash: string) => {
+    const url = transactionRpcUrl(profile, txHash);
+    if (!url) return;
+    setError(null);
+    void openUrl(url).catch((caught) => setError(errorMessage(caught)));
+  };
   const roundCanPrepare = Boolean(
     workspace &&
       (profile === "demo" ||
@@ -410,6 +505,13 @@ function App() {
       lightwalletdUrl.trim() &&
       custodianAcknowledged,
   );
+  const activeRounds = rounds.filter((round) => round.isActive);
+  const inactiveRounds = rounds.filter((round) => !round.isActive);
+  const inactiveRoundsLabel = inactiveRounds.every(
+    (round) => round.statusLabel.trim().toLowerCase() === "finalized",
+  )
+    ? "Finalized rounds"
+    : "Inactive rounds";
 
   return (
     <div className={`app-shell profile-${profile}`}>
@@ -472,42 +574,58 @@ function App() {
           ) : rounds.length === 0 ? (
             <div className="empty-rounds">No authenticated rounds are available.</div>
           ) : (
-            rounds.map((round) => (
-              <button
-                key={round.roundId}
-                className={`round-row ${selectedRoundId === round.roundId ? "active" : ""}`}
-                onClick={() => void selectRound(round.roundId)}
-                disabled={busy === "vote" || busy === "custodian"}
-              >
-                <div>
-                  <span className={`status-pin ${round.isActive ? "live" : "closed"}`} />
-                  <strong>{round.title}</strong>
+            <>
+              <div className="round-group">
+                {activeRounds.length === 0 ? (
+                  <div className="empty-active-rounds">No active rounds.</div>
+                ) : (
+                  activeRounds.map((round) => (
+                    <RoundRow
+                      key={round.roundId}
+                      round={round}
+                      selected={selectedRoundId === round.roundId}
+                      disabled={busy === "vote" || busy === "custodian"}
+                      onSelect={selectRound}
+                    />
+                  ))
+                )}
+              </div>
+              {inactiveRounds.length > 0 && (
+                <div className="round-archive">
+                  <button
+                    className="round-archive-toggle"
+                    type="button"
+                    aria-expanded={inactiveRoundsOpen}
+                    aria-controls="inactive-rounds"
+                    onClick={() => setInactiveRoundsOpen((open) => !open)}
+                  >
+                    <ChevronIcon />
+                    <span>{inactiveRoundsLabel}</span>
+                    <small>{inactiveRounds.length}</small>
+                  </button>
+                  {inactiveRoundsOpen && (
+                    <div className="round-group" id="inactive-rounds">
+                      {inactiveRounds.map((round) => (
+                        <RoundRow
+                          key={round.roundId}
+                          round={round}
+                          selected={selectedRoundId === round.roundId}
+                          disabled={busy === "vote" || busy === "custodian"}
+                          onSelect={selectRound}
+                        />
+                      ))}
+                    </div>
+                  )}
                 </div>
-                <small>
-                  {round.statusLabel}
-                  {round.stored ? " · On this device" : ""}
-                </small>
-              </button>
-            ))
+              )}
+            </>
           )}
         </div>
 
         <div className="sidebar-footer">
-          <button className="sidebar-action" onClick={() => setBackupMode("export")}>
-            <DownloadIcon /> Export recovery backup
+          <button className="sidebar-action" onClick={() => setSettingsOpen(true)} disabled={Boolean(busy)}>
+            <SettingsIcon /> Settings
           </button>
-          <button className="sidebar-action" onClick={() => setBackupMode("restore")}>
-            <UploadIcon /> Restore recovery backup
-          </button>
-          {profile === "demo" && (
-            <button
-              className="sidebar-action danger"
-              onClick={() => void resetDemo()}
-              disabled={Boolean(busy)}
-            >
-              <TrashIcon /> Reset local demo
-            </button>
-          )}
           <div className="security-footnote">
             <LockIcon />
             <span>Hotkeys remain in your operating-system Keychain.</span>
@@ -585,7 +703,7 @@ function App() {
               targetReady={workspace.progress.targetReady}
               capabilityReady={workspace.progress.capabilityImported}
               delegationReady={delegationReady}
-              voteReady={expectedVoteCount > 0 && workspace.progress.confirmedVoteCount >= expectedVoteCount}
+              voteReady={voteComplete}
             />
 
             <section className="workflow-card" id="target">
@@ -632,9 +750,9 @@ function App() {
                     <div className="backup-callout">
                       <LockIcon />
                       <span>
-                        Back up now. The public target cannot recreate your hotkey if this device is lost.
+                        Protect this hotkey with an encrypted recovery backup from Settings.
                       </span>
-                      <button onClick={() => setBackupMode("export")}>Export backup</button>
+                      <button onClick={() => setSettingsOpen(true)}>Open settings</button>
                     </div>
                   </div>
                 ) : (
@@ -921,129 +1039,163 @@ function App() {
             <section className={`workflow-card vote-card ${!delegationReady ? "locked" : ""}`} id="vote">
               <CardNumber
                 number="04"
-                done={expectedVoteCount > 0 && workspace.progress.confirmedVoteCount >= expectedVoteCount}
+                done={voteComplete}
               />
               <div className="card-body">
                 <div className="card-heading">
                   <div>
                     <span className="section-kicker">Private ballot</span>
-                    <h2>Review and cast your vote</h2>
+                    <h2>{voteComplete ? "Your vote is complete" : "Review and cast your vote"}</h2>
                     <p>
-                      Your selections are proved and signed locally. One vote is produced for each delegated bundle and proposal.
+                      {voteComplete
+                        ? "The confirmed receipt and your locked selections were restored from this device."
+                        : "Your selections are proved and signed locally. One vote is produced for each delegated bundle and proposal."}
                     </p>
                   </div>
                   <BallotIcon />
                 </div>
 
                 <div className="proposal-list">
-                  {workspace.round.proposals.map((proposal, proposalIndex) => (
-                    <fieldset
-                      className="proposal"
-                      key={proposal.id}
-                      disabled={
-                        !delegationReady ||
-                        busy === "vote" ||
-                        workspace.votes.some((vote) => vote.proposalId === proposal.id)
-                      }
-                    >
-                      <legend>
-                        <span>{String(proposalIndex + 1).padStart(2, "0")}</span>
-                        <div>
+                  {workspace.round.proposals.map((proposal, proposalIndex) => {
+                    const selectionLocked = workspace.votes.some(
+                      (vote) => vote.proposalId === proposal.id,
+                    );
+                    return (
+                      <fieldset
+                        className="proposal"
+                        key={proposal.id}
+                        disabled={!delegationReady || busy === "vote" || selectionLocked}
+                      >
+                        <legend>
+                          <span>{String(proposalIndex + 1).padStart(2, "0")}</span>
                           <strong>{proposal.title}</strong>
-                          {proposal.description && <small>{proposal.description}</small>}
-                          {workspace.votes.some((vote) => vote.proposalId === proposal.id) && (
-                            <small>Selection locked by persisted vote recovery state.</small>
-                          )}
+                        </legend>
+                        {(proposal.description || selectionLocked) && (
+                          <div className="proposal-details">
+                            {proposal.description && <small>{proposal.description}</small>}
+                            {selectionLocked && (
+                              <small>Selection locked by persisted vote recovery state.</small>
+                            )}
+                          </div>
+                        )}
+                        <div className="option-grid">
+                          {proposal.options.map((option) => {
+                            const checked = choices[proposal.id] === option.index;
+                            return (
+                              <label className={`vote-option ${checked ? "selected" : ""}`} key={option.index}>
+                                <input
+                                  type="radio"
+                                  name={`proposal-${proposal.id}`}
+                                  checked={checked}
+                                  onChange={() => {
+                                    setChoices((current) => ({ ...current, [proposal.id]: option.index }));
+                                    setReviewed(false);
+                                  }}
+                                />
+                                <span className="radio-mark"><span /></span>
+                                <span>
+                                  <strong>{option.label}</strong>
+                                  {option.description && <small>{option.description}</small>}
+                                </span>
+                              </label>
+                            );
+                          })}
                         </div>
-                      </legend>
-                      <div className="option-grid">
-                        {proposal.options.map((option) => {
-                          const checked = choices[proposal.id] === option.index;
-                          return (
-                            <label className={`vote-option ${checked ? "selected" : ""}`} key={option.index}>
-                              <input
-                                type="radio"
-                                name={`proposal-${proposal.id}`}
-                                checked={checked}
-                                onChange={() => {
-                                  setChoices((current) => ({ ...current, [proposal.id]: option.index }));
-                                  setReviewed(false);
-                                }}
-                              />
-                              <span className="radio-mark"><span /></span>
-                              <span>
-                                <strong>{option.label}</strong>
-                                {option.description && <small>{option.description}</small>}
-                              </span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    </fieldset>
-                  ))}
+                      </fieldset>
+                    );
+                  })}
                 </div>
 
-                <div className="review-panel">
+                <div className={`review-panel ${voteComplete ? "completed" : ""}`}>
                   <div className="review-stats">
                     <div><span>Selections</span><strong>{completeChoiceCount}/{workspace.round.proposals.length}</strong></div>
                     <div><span>Delegated bundles</span><strong>{workspace.progress.bundleCount || "—"}</strong></div>
                     <div><span>Proof-backed votes</span><strong>{expectedVoteCount || "—"}</strong></div>
                   </div>
-                  <label className="review-check">
-                    <input
-                      type="checkbox"
-                      checked={reviewed}
-                      onChange={(event) => setReviewed(event.target.checked)}
-                      disabled={!delegationReady || completeChoiceCount !== workspace.round.proposals.length || busy === "vote"}
-                    />
-                    <span><CheckIcon /></span>
-                    I reviewed the network, round, and every selection above.
-                  </label>
-                  {busy === "vote" && voteProgress && (
-                    <div className="vote-progress">
-                      <div>
-                        <Spinner />
-                        <span>
-                          <strong>{voteProgress.message}</strong>
-                          {(voteProgress.bundleIndex !== null || voteProgress.proposalId !== null) && (
-                            <small>
-                              {voteProgress.bundleIndex !== null ? `Bundle ${voteProgress.bundleIndex + 1}` : ""}
-                              {voteProgress.bundleIndex !== null && voteProgress.proposalId !== null ? " · " : ""}
-                              {voteProgress.proposalId !== null ? `Proposal ${voteProgress.proposalId}` : ""}
-                            </small>
-                          )}
-                        </span>
-                      </div>
-                      <div className={`progress-track ${voteProgress.progress === null ? "indeterminate" : ""}`}>
-                        <span style={voteProgress.progress === null ? undefined : { width: `${voteProgress.progress * 100}%` }} />
-                      </div>
-                      <p>Keep this app open. Proof generation can take several minutes on the first run.</p>
-                    </div>
-                  )}
-                  <button className="cast-button" onClick={() => void castVotes()} disabled={!voteReady || Boolean(busy)}>
-                    {busy === "vote" ? <Spinner /> : <ShieldIcon />}
-                    {profile === "demo" ? "Run local proof rehearsal" : "Generate proofs and cast vote"}
-                    {busy !== "vote" && <ArrowIcon />}
-                  </button>
-                  {!workspace.round.isActive && profile !== "demo" && (
-                    <p className="closed-note">This authenticated round is {workspace.round.statusLabel.toLowerCase()} and cannot accept a new vote.</p>
+                  {!voteComplete && (
+                    <>
+                      <label className="review-check">
+                        <input
+                          type="checkbox"
+                          checked={reviewed}
+                          onChange={(event) => setReviewed(event.target.checked)}
+                          disabled={!delegationReady || completeChoiceCount !== workspace.round.proposals.length || busy === "vote"}
+                        />
+                        <span><CheckIcon /></span>
+                        I reviewed the network, round, and every selection above.
+                      </label>
+                      {busy === "vote" && voteProgress && (
+                        <div className="vote-progress">
+                          <div>
+                            <Spinner />
+                            <span>
+                              <strong>{voteProgress.message}</strong>
+                              {(voteProgress.bundleIndex !== null || voteProgress.proposalId !== null) && (
+                                <small>
+                                  {voteProgress.bundleIndex !== null ? `Bundle ${voteProgress.bundleIndex + 1}` : ""}
+                                  {voteProgress.bundleIndex !== null && voteProgress.proposalId !== null ? " · " : ""}
+                                  {voteProgress.proposalId !== null ? `Proposal ${voteProgress.proposalId}` : ""}
+                                </small>
+                              )}
+                            </span>
+                          </div>
+                          <div className={`progress-track ${voteProgress.progress === null ? "indeterminate" : ""}`}>
+                            <span style={voteProgress.progress === null ? undefined : { width: `${voteProgress.progress * 100}%` }} />
+                          </div>
+                          <p>Keep this app open. Proof generation can take several minutes on the first run.</p>
+                        </div>
+                      )}
+                      <button className="cast-button" onClick={() => void castVotes()} disabled={!voteReady || Boolean(busy)}>
+                        {busy === "vote" ? <Spinner /> : <ShieldIcon />}
+                        {voteActionLabel}
+                        {busy !== "vote" && <ArrowIcon />}
+                      </button>
+                      {!workspace.round.isActive && profile !== "demo" && (
+                        <p className="closed-note">This authenticated round is {workspace.round.statusLabel.toLowerCase()} and cannot accept a new vote.</p>
+                      )}
+                    </>
                   )}
                 </div>
 
-                {voteResult && (
+                {(voteResult || voteComplete) && (
                   <div className="result-panel">
                     <div className="result-icon"><CheckIcon /></div>
                     <div>
-                      <strong>{voteResult.demo ? "Local rehearsal complete" : "Vote confirmed"}</strong>
+                      <strong>
+                        {profile === "demo"
+                          ? voteResult
+                            ? "Local rehearsal complete"
+                            : "Local rehearsal already complete"
+                          : voteResult
+                            ? "Vote confirmed"
+                            : "Vote already cast"}
+                      </strong>
                       <p>
-                        {voteResult.proofCount} proof-backed vote{voteResult.proofCount === 1 ? "" : "s"} processed across {workspace.progress.bundleCount} bundle{workspace.progress.bundleCount === 1 ? "" : "s"}.
+                        {voteResult
+                          ? `${voteResult.proofCount} proof-backed vote${voteResult.proofCount === 1 ? "" : "s"} processed across ${workspace.progress.bundleCount} bundle${workspace.progress.bundleCount === 1 ? "" : "s"}.`
+                          : profile === "demo"
+                            ? `${workspace.progress.confirmedVoteCount} proof-backed vote${workspace.progress.confirmedVoteCount === 1 ? "" : "s"} completed in this local rehearsal.`
+                            : `${workspace.progress.confirmedVoteCount} proof-backed vote${workspace.progress.confirmedVoteCount === 1 ? "" : "s"} confirmed. Helper share delivery is complete.`}
                       </p>
                       <div className="transaction-list">
-                        {voteResult.transactions.map((transaction) => (
-                          <code key={`${transaction.bundleIndex}-${transaction.proposalId}`}>
-                            B{transaction.bundleIndex + 1} · P{transaction.proposalId} · {shortId(transaction.txHash)}
-                          </code>
-                        ))}
+                        {receiptTransactions.map((transaction) => {
+                          const label = `B${transaction.bundleIndex + 1} · P${transaction.proposalId} · ${shortId(transaction.txHash)}`;
+                          return profile === "demo" ? (
+                            <code key={`${transaction.bundleIndex}-${transaction.proposalId}`}>{label}</code>
+                          ) : (
+                            <button
+                              type="button"
+                              className="transaction-link"
+                              key={`${transaction.bundleIndex}-${transaction.proposalId}`}
+                              onClick={() => openTransaction(transaction.txHash)}
+                              title={`Open transaction ${transaction.txHash} with its ${profileLabel(profile)} RPC proof`}
+                              aria-label={`Open transaction ${transaction.txHash} with its ${profileLabel(profile)} RPC proof`}
+                            >
+                              <code>{label}</code>
+                              <ExternalLinkIcon />
+                            </button>
+                          );
+                        })}
                       </div>
                     </div>
                   </div>
@@ -1053,6 +1205,111 @@ function App() {
           </div>
         )}
       </main>
+
+      {settingsOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setSettingsOpen(false)}>
+          <section
+            className="modal settings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button className="modal-close" onClick={() => setSettingsOpen(false)} aria-label="Close">×</button>
+            <div className="modal-icon"><SettingsIcon /></div>
+            <span className="section-kicker">Application</span>
+            <h2 id="settings-title">Settings</h2>
+            <p>Manage recovery for the selected network or clear all locally stored voting state.</p>
+
+            <div className="settings-section">
+              <div className="settings-section-heading">
+                <div>
+                  <strong>Recovery backup</strong>
+                  <span>Encrypted backup files are scoped to one network profile.</span>
+                </div>
+                <small>{profileLabel(profile)}</small>
+              </div>
+              <div className="settings-actions">
+                <button className="secondary" onClick={() => openBackupFromSettings("export")}>
+                  <DownloadIcon /> Export backup
+                </button>
+                <button className="secondary" onClick={() => openBackupFromSettings("restore")}>
+                  <UploadIcon /> Restore backup
+                </button>
+              </div>
+            </div>
+
+            <div className="settings-section danger-zone">
+              <div className="settings-section-heading">
+                <div>
+                  <strong>Reset application</strong>
+                  <span>Remove every local profile and voting hotkey from this computer.</span>
+                </div>
+              </div>
+              <button className="danger-button" onClick={() => void openResetConfirmation()} disabled={busy === "prepare-reset"}>
+                {busy === "prepare-reset" ? <Spinner /> : <TrashIcon />} Reset all app data
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {resetConfirmOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => closeResetConfirmation()}>
+          <section
+            className="modal reset-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="reset-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              onClick={() => closeResetConfirmation()}
+              aria-label="Close"
+              disabled={busy === "reset"}
+            >
+              ×
+            </button>
+            <div className="modal-icon danger"><WarningIcon /></div>
+            <span className="section-kicker danger-text">Destructive action</span>
+            <h2 id="reset-title">Reset all app data?</h2>
+            <p>This permanently removes the local voting state stored by Zcash Custody Voter on this computer.</p>
+            <ul className="reset-impact">
+              <li>Demo, Testnet, and Mainnet voting databases</li>
+              <li>Imported custody payloads, selections, and receipts</li>
+              <li>Voting hotkeys stored in the operating-system Keychain</li>
+            </ul>
+            <div className="modal-warning danger">
+              <WarningIcon />
+              <span>This does not move custody funds or undo votes already recorded on-chain. Local recovery requires an encrypted backup exported beforehand.</span>
+            </div>
+            <label className="reset-confirm-check">
+              <input
+                type="checkbox"
+                checked={resetAcknowledged}
+                onChange={(event) => setResetAcknowledged(event.target.checked)}
+                disabled={busy === "reset"}
+              />
+              <span><CheckIcon /></span>
+              I understand that this local data will be permanently removed.
+            </label>
+            <div className="modal-button-row">
+              <button className="secondary" onClick={() => closeResetConfirmation(true)} disabled={busy === "reset"}>
+                Cancel
+              </button>
+              <button
+                className="danger-button"
+                onClick={() => void resetAllData()}
+                disabled={!resetAcknowledged || !resetToken || busy === "reset"}
+              >
+                {busy === "reset" ? <Spinner /> : <TrashIcon />}
+                Yes, reset all data
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {backupMode && (
         <div className="modal-backdrop" role="presentation" onMouseDown={closeBackupDialog}>
@@ -1178,6 +1435,35 @@ function RoundSkeleton() {
   );
 }
 
+function RoundRow({
+  round,
+  selected,
+  disabled,
+  onSelect,
+}: {
+  round: RoundCard;
+  selected: boolean;
+  disabled: boolean;
+  onSelect: (roundId: string) => Promise<void>;
+}) {
+  return (
+    <button
+      className={`round-row ${selected ? "active" : ""}`}
+      onClick={() => void onSelect(round.roundId)}
+      disabled={disabled}
+    >
+      <div>
+        <span className={`status-pin ${round.isActive ? "live" : "closed"}`} />
+        <strong>{round.title}</strong>
+      </div>
+      <small>
+        {round.statusLabel}
+        {round.stored ? " · On this device" : ""}
+      </small>
+    </button>
+  );
+}
+
 function existingChoices(workspace: RoundWorkspace): Record<number, number> {
   const result: Record<number, number> = {};
   for (const vote of workspace.votes) {
@@ -1203,6 +1489,12 @@ function formatDate(timestamp: number) {
 
 function shortId(value: string) {
   return value.length > 22 ? `${value.slice(0, 12)}…${value.slice(-8)}` : value;
+}
+
+function transactionRpcUrl(profile: Profile, txHash: string) {
+  if (profile === "demo") return null;
+  const base = profile === "testnet" ? TESTNET_TRANSACTION_RPC : MAINNET_TRANSACTION_RPC;
+  return `${base}?hash=0x${encodeURIComponent(txHash)}&prove=true`;
 }
 
 async function copyText(value: string, notify: (message: string) => void) {
@@ -1231,6 +1523,7 @@ function Icon({ children }: { children: React.ReactNode }) {
 const CheckIcon = () => <Icon><path d="m5 12 4 4L19 6" /></Icon>;
 const WarningIcon = () => <Icon><path d="M12 3 2.7 20h18.6L12 3Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></Icon>;
 const RefreshIcon = () => <Icon><path d="M20 11a8 8 0 0 0-14.8-4L3 10" /><path d="M3 4v6h6" /><path d="M4 13a8 8 0 0 0 14.8 4L21 14" /><path d="M21 20v-6h-6" /></Icon>;
+const ChevronIcon = () => <Icon><path d="m8 10 4 4 4-4" /></Icon>;
 const DownloadIcon = () => <Icon><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M4 20h16" /></Icon>;
 const UploadIcon = () => <Icon><path d="M12 16V4" /><path d="m7 9 5-5 5 5" /><path d="M4 20h16" /></Icon>;
 const TrashIcon = () => <Icon><path d="M4 7h16" /><path d="m9 7 1-3h4l1 3" /><path d="m6 7 1 14h10l1-14" /></Icon>;
@@ -1242,6 +1535,8 @@ const InboxIcon = () => <Icon><path d="M4 4h16v16H4z" /><path d="m4 13 4-4h8l4 4
 const ChainIcon = () => <Icon><path d="m9 15-2 2a3 3 0 1 1-4-4l3-3a3 3 0 0 1 4 0" /><path d="m15 9 2-2a3 3 0 1 1 4 4l-3 3a3 3 0 0 1-4 0" /><path d="m8 16 8-8" /></Icon>;
 const BallotIcon = () => <Icon><path d="M6 3h12v18H6z" /><path d="M9 7h6" /><path d="M9 11h6" /><path d="M9 15h3" /></Icon>;
 const ArrowIcon = () => <Icon><path d="M5 12h14" /><path d="m14 7 5 5-5 5" /></Icon>;
+const ExternalLinkIcon = () => <Icon><path d="M14 4h6v6" /><path d="m20 4-9 9" /><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6" /></Icon>;
+const SettingsIcon = () => <Icon><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z" /></Icon>;
 const WalletIcon = () => <Icon><path d="M4 7.5h15a2 2 0 0 1 2 2v9.5H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h13" /><path d="M17 12h4" /><circle cx="17" cy="14" r=".5" fill="currentColor" stroke="none" /></Icon>;
 
 function Spinner() {

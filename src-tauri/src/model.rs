@@ -108,6 +108,8 @@ pub struct RoundProgress {
     pub vote_count: u32,
     pub submitted_vote_count: u32,
     pub confirmed_vote_count: u32,
+    pub required_share_count: u32,
+    pub submitted_share_count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -282,5 +284,6 @@ pub struct RestoreResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResetResult {
+    pub removed_profiles: u32,
     pub removed_rounds: u32,
 }

@@ -15,8 +15,8 @@ use zcash_voting::{round::VotingDb, VotingHotkey, BALLOT_DIVISOR};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::model::{
-    BackupEnvelope, BackupHotkey, BackupResult, Profile, ProfileManifest, RestoreResult,
-    RoundProgress, VoteRecordView, BACKUP_FORMAT_VERSION, MANIFEST_FORMAT_VERSION,
+    BackupEnvelope, BackupHotkey, BackupResult, Profile, ProfileManifest, ResetResult,
+    RestoreResult, RoundProgress, VoteRecordView, BACKUP_FORMAT_VERSION, MANIFEST_FORMAT_VERSION,
 };
 
 const KEYRING_SERVICE_PREFIX: &str = "com.valargroup.custodyvoter";
@@ -160,6 +160,75 @@ pub fn delete_hotkey(profile: Profile, round_id: &str) -> Result<(), String> {
     }
 }
 
+/// Removes every known local voting profile and its associated Keychain hotkeys.
+///
+/// Hotkeys are captured before deletion so a Keychain failure can restore the
+/// previous credentials while the corresponding manifests are still available.
+pub fn reset_all_data(app_data_dir: &Path) -> Result<ResetResult, String> {
+    let mut profiles = Vec::new();
+    let mut removed_rounds = 0u32;
+    for profile in [Profile::Mainnet, Profile::Testnet, Profile::Demo] {
+        let directory = app_data_dir.join(profile.slug());
+        if !directory.exists() {
+            continue;
+        }
+        let paths = ProfilePaths {
+            database: directory.join("voting.sqlite"),
+            manifest: directory.join("manifest.json"),
+            directory,
+        };
+        let manifest = read_manifest(&paths, profile)?;
+        removed_rounds = removed_rounds
+            .checked_add(
+                u32::try_from(manifest.rounds.len())
+                    .map_err(|_| "stored round count exceeds u32".to_string())?,
+            )
+            .ok_or_else(|| "stored round count exceeds u32".to_string())?;
+        let round_ids = manifest.rounds.keys().cloned().collect::<BTreeSet<_>>();
+        let hotkeys = capture_hotkeys(profile, &round_ids)?;
+        profiles.push((profile, paths, hotkeys));
+    }
+
+    let keyring_reset = (|| {
+        for (profile, _, hotkeys) in &profiles {
+            for round_id in hotkeys.keys() {
+                delete_hotkey(*profile, round_id)?;
+            }
+        }
+        Ok::<_, String>(())
+    })();
+    if let Err(error) = keyring_reset {
+        let mut rollback_errors = Vec::new();
+        for (profile, _, hotkeys) in &profiles {
+            if let Err(rollback_error) = restore_captured_hotkeys(*profile, hotkeys) {
+                rollback_errors.push(rollback_error);
+            }
+        }
+        return Err(if rollback_errors.is_empty() {
+            error
+        } else {
+            format!(
+                "{error}; restoring the previous Keychain state also failed: {}",
+                rollback_errors.join("; ")
+            )
+        });
+    }
+    if app_data_dir.exists() {
+        fs::remove_dir_all(app_data_dir).map_err(|error| {
+            format!(
+                "remove application data directory {} failed: {error}",
+                app_data_dir.display()
+            )
+        })?;
+    }
+
+    Ok(ResetResult {
+        removed_profiles: u32::try_from(profiles.len())
+            .map_err(|_| "stored profile count exceeds u32".to_string())?,
+        removed_rounds,
+    })
+}
+
 pub fn round_progress(
     paths: &ProfilePaths,
     profile: Profile,
@@ -198,6 +267,42 @@ pub fn round_progress(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| format!("load vote progress failed: {error}"))?;
+    let required_share_count = {
+        let mut statement = conn
+            .prepare(
+                "SELECT commitment_bundle_json
+                 FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND commitment_bundle_json IS NOT NULL",
+            )
+            .map_err(|error| format!("prepare helper share progress query failed: {error}"))?;
+        let rows = statement
+            .query_map(
+                named_params! { ":round_id": round_id, ":wallet_id": wallet },
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("query required helper shares failed: {error}"))?;
+        let mut total = 0u32;
+        for row in rows {
+            let commitment_json =
+                row.map_err(|error| format!("decode vote commitment state failed: {error}"))?;
+            total = total
+                .checked_add(encrypted_share_count(&commitment_json)?)
+                .ok_or_else(|| {
+                    "required helper share count is outside the supported range".to_string()
+                })?;
+        }
+        total
+    };
+    let submitted_share_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM share_delegations
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet },
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("load submitted helper share progress failed: {error}"))?;
     let (bundle_count, confirmed_bundle_count, delegated_value) = bundle_stats.unwrap_or_default();
     Ok(RoundProgress {
         target_ready,
@@ -208,7 +313,20 @@ pub fn round_progress(
         vote_count: to_u32(vote_stats.0, "vote count")?,
         submitted_vote_count: to_u32(vote_stats.1, "submitted vote count")?,
         confirmed_vote_count: to_u32(vote_stats.2, "confirmed vote count")?,
+        required_share_count,
+        submitted_share_count: to_u32(submitted_share_count, "submitted helper share count")?,
     })
+}
+
+fn encrypted_share_count(commitment_json: &str) -> Result<u32, String> {
+    let commitment: serde_json::Value = serde_json::from_str(commitment_json)
+        .map_err(|error| format!("decode stored vote commitment failed: {error}"))?;
+    let shares = commitment
+        .get("encrypted_shares")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "stored vote commitment has no encrypted share list".to_string())?;
+    u32::try_from(shares.len())
+        .map_err(|_| "required helper share count is outside the supported range".to_string())
 }
 
 pub fn vote_records(
@@ -702,5 +820,87 @@ mod tests {
             ],
         };
         assert!(validate_backup_envelope(&envelope, Profile::Demo).is_err());
+    }
+
+    #[test]
+    fn round_progress_distinguishes_confirmed_votes_from_complete_share_delivery() {
+        let database =
+            std::env::temp_dir().join(format!("custody-voter-progress-{}.sqlite", Uuid::new_v4()));
+        let _database = TemporaryDatabase(database.clone());
+        let paths = ProfilePaths {
+            directory: std::env::temp_dir(),
+            manifest: database.with_extension("json"),
+            database,
+        };
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        let wallet = db.wallet_id().to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO rounds (
+                    round_id, wallet_id, network, snapshot_height, ea_pk, nc_root,
+                    nullifier_imt_root, created_at
+                 ) VALUES ('round', ?1, 'testnet', 1, X'00', X'00', X'00', 1)",
+                [&wallet],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (
+                    round_id, wallet_id, bundle_index, total_note_value, van_leaf_position
+                 ) VALUES ('round', ?1, 0, 0, 7)",
+                [&wallet],
+            )
+            .unwrap();
+        for (proposal_id, commitment_json) in [
+            (1, r#"{"encrypted_shares":[{},{}]}"#),
+            (2, r#"{"encrypted_shares":[{},{},{}]}"#),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO votes (
+                        round_id, wallet_id, bundle_index, proposal_id, choice, created_at,
+                        tx_hash, vc_tree_position, commitment_bundle_json
+                     ) VALUES ('round', ?1, 0, ?2, 0, 1, 'tx', 8, ?3)",
+                    rusqlite::params![wallet, proposal_id, commitment_json],
+                )
+                .unwrap();
+        }
+        for (proposal_id, share_index) in [(1, 0), (1, 1), (2, 0), (2, 1)] {
+            db.conn()
+                .execute(
+                    "INSERT INTO share_delegations (
+                        round_id, wallet_id, bundle_index, proposal_id, share_index,
+                        sent_to_urls, nullifier, confirmed, submit_at, created_at
+                     ) VALUES ('round', ?1, 0, ?2, ?3, '[]', X'00', 1, 1, 1)",
+                    rusqlite::params![wallet, proposal_id, share_index],
+                )
+                .unwrap();
+        }
+        drop(db);
+
+        let progress = round_progress(&paths, Profile::Testnet, "round", true).unwrap();
+        assert_eq!(progress.vote_count, 2);
+        assert_eq!(progress.confirmed_vote_count, 2);
+        assert_eq!(progress.required_share_count, 5);
+        assert_eq!(progress.submitted_share_count, 4);
+    }
+
+    #[test]
+    fn reset_all_data_removes_every_existing_profile_directory() {
+        let root = std::env::temp_dir().join(format!("custody-voter-reset-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        for profile in [Profile::Mainnet, Profile::Testnet] {
+            let paths = profile_paths(&root, profile).unwrap();
+            write_manifest(&paths, &ProfileManifest::empty(profile)).unwrap();
+            fs::write(paths.directory.join("profile-state"), b"state").unwrap();
+        }
+        let test_custodian = root.join("test-custodian").join("testnet");
+        fs::create_dir_all(&test_custodian).unwrap();
+        fs::write(test_custodian.join("provider-voting.sqlite"), b"state").unwrap();
+
+        let result = reset_all_data(&root).unwrap();
+        assert_eq!(result.removed_profiles, 2);
+        assert_eq!(result.removed_rounds, 0);
+        assert!(!root.exists());
     }
 }
