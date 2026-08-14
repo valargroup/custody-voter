@@ -549,12 +549,24 @@ async fn post_vote_servers(
         {
             Ok(response) => {
                 let status = response.status();
-                let bytes = bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await?;
+                let bytes = match bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", server.label));
+                        continue;
+                    }
+                };
                 if status.is_success() || status == StatusCode::UNPROCESSABLE_ENTITY {
-                    let result: BroadcastResult =
-                        serde_json::from_slice(&bytes).map_err(|error| {
-                            format!("decode vote submission response failed: {error}")
-                        })?;
+                    let result: BroadcastResult = match serde_json::from_slice(&bytes) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            errors.push(format!(
+                                "{} returned a malformed vote submission response: {error}",
+                                server.label
+                            ));
+                            continue;
+                        }
+                    };
                     if result.code != 0 {
                         return Err(if result.log.trim().is_empty() {
                             format!(
@@ -565,7 +577,13 @@ async fn post_vote_servers(
                             response_message(result.log.as_bytes())
                         });
                     }
-                    validate_tx_hash(&result.tx_hash)?;
+                    if let Err(error) = validate_tx_hash(&result.tx_hash) {
+                        errors.push(format!(
+                            "{} returned an invalid transaction hash: {error}",
+                            server.label
+                        ));
+                        continue;
+                    }
                     return Ok(result);
                 }
                 if status.is_server_error() {
@@ -899,6 +917,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(response, serde_json::json!({"rounds": []}));
+        malformed_handle.join().unwrap();
+        healthy_handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn broadcast_skips_a_malformed_success_response() {
+        let (malformed, malformed_handle) = response_server("malformed", "{");
+        let tx_hash = "cd".repeat(32);
+        let healthy_body = format!(r#"{{"tx_hash":"{tx_hash}","code":0,"log":""}}"#);
+        let (healthy, healthy_handle) = response_server("healthy", &healthy_body);
+        let result = post_vote_servers(
+            &http_client().unwrap(),
+            &[malformed, healthy],
+            "/shielded-vote/v1/cast-vote",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.tx_hash, tx_hash);
         malformed_handle.join().unwrap();
         healthy_handle.join().unwrap();
     }
