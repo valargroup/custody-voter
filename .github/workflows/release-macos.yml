@@ -1,46 +1,47 @@
 name: Signed macOS release
 
-run-name: macOS release ${{ inputs.release_tag || github.ref_name }}
+run-name: macOS release ${{ github.ref_name }}
 
 on:
   push:
     tags:
       - "v[0-9]*"
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Existing version tag to build, for example v1.0.1
-        required: true
-        type: string
 
 concurrency:
-  group: macos-release-${{ inputs.release_tag || github.ref_name }}
+  group: macos-release-${{ github.ref_name }}
   cancel-in-progress: false
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
-  release:
-    name: Sign, notarize, and publish DMG
+  build:
+    name: Build, sign, and notarize DMG
     runs-on: macos-latest
     timeout-minutes: 90
+    environment:
+      name: macos-release
+    permissions:
+      contents: read
+    outputs:
+      built_commit: ${{ steps.release.outputs.built_commit }}
     env:
-      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - name: Check out the release tag
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
           fetch-depth: 0
-          ref: ${{ inputs.release_tag || github.ref }}
+          ref: ${{ github.ref }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
 
       - name: Validate the release tag
+        id: release
         shell: bash
         run: |
           set -euo pipefail
@@ -58,6 +59,7 @@ jobs:
             echo "Release tag $RELEASE_TAG does not match app version $APP_VERSION." >&2
             exit 1
           fi
+          printf 'built_commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust targets
         shell: bash
@@ -179,25 +181,75 @@ jobs:
           )
           printf 'release_dir=%s\n' "$RELEASE_DIR" >> "$GITHUB_OUTPUT"
 
+      - name: Transfer signed release assets
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: macos-release-assets
+          path: |
+            ${{ steps.artifact.outputs.release_dir }}/Custody-Voter-macos.dmg
+            ${{ steps.artifact.outputs.release_dir }}/Custody-Voter-macos.dmg.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/custody-voter-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+
+  publish:
+    name: Publish signed release assets
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      BUILT_COMMIT: ${{ needs.build.outputs.built_commit }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download signed release assets
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: macos-release-assets
+          path: ${{ runner.temp }}/custody-voter-release
+
       - name: Publish GitHub release assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_DIR: ${{ steps.artifact.outputs.release_dir }}
+          RELEASE_DIR: ${{ runner.temp }}/custody-voter-release
         run: |
           set -euo pipefail
 
           require_remote_tag_at_build_commit() {
-            local built_commit remote_commit
+            local remote_commit remote_refs
 
-            built_commit="$(git rev-parse HEAD)"
-            if ! git fetch --force --no-tags origin \
-              "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"; then
+            if ! remote_refs="$(
+              git ls-remote --exit-code --tags \
+                "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
+                "refs/tags/$RELEASE_TAG" \
+                "refs/tags/$RELEASE_TAG^{}"
+            )"; then
               echo "Remote tag $RELEASE_TAG no longer exists; refusing to publish this build." >&2
               exit 1
             fi
-            remote_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
-            if [[ "$remote_commit" != "$built_commit" ]]; then
+            remote_commit="$(
+              printf '%s\n' "$remote_refs" |
+                awk \
+                  -v exact="refs/tags/$RELEASE_TAG" \
+                  -v peeled="refs/tags/$RELEASE_TAG^{}" '
+                    $2 == peeled { print $1; selected = 1; exit }
+                    $2 == exact { fallback = $1 }
+                    END { if (!selected && fallback) print fallback }
+                  '
+            )"
+            if [[ -z "$remote_commit" ]]; then
+              echo "Remote tag $RELEASE_TAG could not be resolved; refusing to publish this build." >&2
+              exit 1
+            fi
+            if [[ "$remote_commit" != "$BUILT_COMMIT" ]]; then
               echo "Remote tag $RELEASE_TAG moved after checkout; refusing to publish this build." >&2
               exit 1
             fi
@@ -248,10 +300,3 @@ jobs:
           gh release edit "$RELEASE_TAG" \
             --draft=false \
             --repo "$GITHUB_REPOSITORY"
-
-      - name: Remove temporary signing material
-        if: always()
-        shell: bash
-        run: |
-          security delete-keychain "$RUNNER_TEMP/custody-voter-signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/developer-id.p12"
