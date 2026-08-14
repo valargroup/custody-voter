@@ -26,7 +26,8 @@ const KEYRING_SERVICE_PREFIX: &str = "com.valargroup.custodyvoter";
 const WALLET_ID_PREFIX: &str = "custody-voter";
 const MIN_BACKUP_PASSPHRASE_CHARS: usize = 12;
 const MAX_BACKUP_PASSPHRASE_CHARS: usize = 1_024;
-const MAX_BACKUP_BYTES: usize = 128 * 1024 * 1024;
+const MAX_BACKUP_DATABASE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_ENCRYPTED_BACKUP_BYTES: usize = 192 * 1024 * 1024;
 type CapturedHotkeys = BTreeMap<String, Option<Zeroizing<Vec<u8>>>>;
 
 #[derive(Clone, Debug)]
@@ -464,6 +465,7 @@ pub fn export_backup(
     drop(db);
     let database = fs::read(&paths.database)
         .map_err(|error| format!("read voting database for backup failed: {error}"))?;
+    validate_backup_database_size(database.len())?;
 
     let mut hotkeys = Vec::with_capacity(manifest.rounds.len());
     for round_id in manifest.rounds.keys() {
@@ -487,6 +489,7 @@ pub fn export_backup(
             .map_err(|error| format!("encode backup envelope failed: {error}"))?,
     );
     let encrypted_bytes = encrypt_age(&passphrase, &plaintext)?;
+    validate_encrypted_backup_size(encrypted_bytes.len())?;
     Ok(BackupResult {
         filename: format!(
             "valar-custody-voter-{}-{}.age",
@@ -504,11 +507,7 @@ pub fn restore_backup(
     encrypted_bytes: Vec<u8>,
 ) -> Result<RestoreResult, String> {
     validate_passphrase(&passphrase)?;
-    if encrypted_bytes.is_empty() || encrypted_bytes.len() > MAX_BACKUP_BYTES {
-        return Err(format!(
-            "encrypted backup must contain 1..={MAX_BACKUP_BYTES} bytes"
-        ));
-    }
+    validate_encrypted_backup_size(encrypted_bytes.len())?;
     let passphrase = Zeroizing::new(passphrase);
     let plaintext = Zeroizing::new(decrypt_age(&passphrase, &encrypted_bytes)?);
     let envelope: BackupEnvelope = serde_json::from_slice(&plaintext)
@@ -520,9 +519,7 @@ pub fn restore_backup(
             .decode(envelope.voting_database_base64.as_bytes())
             .map_err(|error| format!("decode backed-up voting database failed: {error}"))?,
     );
-    if database.is_empty() || database.len() > MAX_BACKUP_BYTES {
-        return Err("backed-up voting database has an invalid size".to_string());
-    }
+    validate_backup_database_size(database.len())?;
 
     let temp_database = paths
         .directory
@@ -926,6 +923,26 @@ fn validate_passphrase(passphrase: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_encrypted_backup_size(byte_len: usize) -> Result<(), String> {
+    if byte_len == 0 || byte_len > MAX_ENCRYPTED_BACKUP_BYTES {
+        Err(format!(
+            "encrypted backup must contain 1..={MAX_ENCRYPTED_BACKUP_BYTES} bytes"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_backup_database_size(byte_len: usize) -> Result<(), String> {
+    if byte_len == 0 || byte_len > MAX_BACKUP_DATABASE_BYTES {
+        Err(format!(
+            "backed-up voting database must contain 1..={MAX_BACKUP_DATABASE_BYTES} bytes"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn unix_seconds() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -957,6 +974,17 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), b"replacement");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn backup_limits_allow_for_database_base64_expansion() {
+        let encoded_database_len = MAX_BACKUP_DATABASE_BYTES.div_ceil(3) * 4;
+
+        assert!(encoded_database_len < MAX_ENCRYPTED_BACKUP_BYTES);
+        assert!(validate_backup_database_size(MAX_BACKUP_DATABASE_BYTES).is_ok());
+        assert!(validate_backup_database_size(MAX_BACKUP_DATABASE_BYTES + 1).is_err());
+        assert!(validate_encrypted_backup_size(MAX_ENCRYPTED_BACKUP_BYTES).is_ok());
+        assert!(validate_encrypted_backup_size(MAX_ENCRYPTED_BACKUP_BYTES + 1).is_err());
     }
 
     #[test]
