@@ -11,12 +11,15 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use keyring::Entry;
 use rusqlite::{named_params, OptionalExtension};
 use uuid::Uuid;
-use zcash_voting::{round::VotingDb, VotingHotkey, BALLOT_DIVISOR};
+use zcash_voting::{
+    round::VotingDb, share_policy::share_submission_target_count, VotingHotkey, BALLOT_DIVISOR,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::model::{
     BackupEnvelope, BackupHotkey, BackupResult, Profile, ProfileManifest, ResetResult,
-    RestoreResult, RoundProgress, VoteRecordView, BACKUP_FORMAT_VERSION, MANIFEST_FORMAT_VERSION,
+    RestoreResult, RoundProgress, ServiceEndpointView, VoteRecordView, BACKUP_FORMAT_VERSION,
+    MANIFEST_FORMAT_VERSION,
 };
 
 const KEYRING_SERVICE_PREFIX: &str = "com.valargroup.custodyvoter";
@@ -222,6 +225,7 @@ pub fn round_progress(
     profile: Profile,
     round_id: &str,
     target_ready: bool,
+    helper_servers: &[ServiceEndpointView],
 ) -> Result<RoundProgress, String> {
     if !paths.database.exists() {
         return Ok(RoundProgress {
@@ -282,15 +286,46 @@ pub fn round_progress(
         }
         total
     };
-    let submitted_share_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*)
-             FROM share_delegations
-             WHERE round_id = :round_id AND wallet_id = :wallet_id",
-            named_params! { ":round_id": round_id, ":wallet_id": wallet },
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("load submitted helper share progress failed: {error}"))?;
+    let helper_target_count = share_submission_target_count(helper_servers.len());
+    let submitted_share_count = if helper_target_count == 0 {
+        0
+    } else {
+        let mut statement = conn
+            .prepare(
+                "SELECT sent_to_urls
+                 FROM share_delegations
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            )
+            .map_err(|error| format!("prepare submitted helper share query failed: {error}"))?;
+        let rows = statement
+            .query_map(
+                named_params! { ":round_id": round_id, ":wallet_id": wallet },
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("query submitted helper shares failed: {error}"))?;
+        let mut complete = 0u32;
+        for row in rows {
+            let sent_to_urls =
+                row.map_err(|error| format!("decode helper share delivery failed: {error}"))?;
+            let sent_to_urls: Vec<String> = serde_json::from_str(&sent_to_urls)
+                .map_err(|error| format!("decode helper share server list failed: {error}"))?;
+            let accepted_count = sent_to_urls
+                .into_iter()
+                .filter(|url| {
+                    helper_servers
+                        .iter()
+                        .any(|server| server.url.as_str() == url.as_str())
+                })
+                .collect::<BTreeSet<_>>()
+                .len();
+            if accepted_count >= helper_target_count {
+                complete = complete.checked_add(1).ok_or_else(|| {
+                    "submitted helper share count is outside the supported range".to_string()
+                })?;
+            }
+        }
+        complete
+    };
     let (bundle_count, confirmed_bundle_count, delegated_value) = bundle_stats.unwrap_or_default();
     Ok(RoundProgress {
         target_ready,
@@ -302,7 +337,7 @@ pub fn round_progress(
         submitted_vote_count: to_u32(vote_stats.1, "submitted vote count")?,
         confirmed_vote_count: to_u32(vote_stats.2, "confirmed vote count")?,
         required_share_count,
-        submitted_share_count: to_u32(submitted_share_count, "submitted helper share count")?,
+        submitted_share_count,
     })
 }
 
@@ -948,24 +983,34 @@ mod tests {
                 )
                 .unwrap();
         }
-        for (proposal_id, share_index) in [(1, 0), (1, 1), (2, 0), (2, 1)] {
+        for (proposal_id, share_index, sent_to_urls) in [
+            (1, 0, r#"["helper-a","helper-b"]"#),
+            (1, 1, r#"["helper-a"]"#),
+            (2, 0, r#"["helper-a","helper-b"]"#),
+            (2, 1, r#"["helper-a","helper-b","helper-b"]"#),
+        ] {
             db.conn()
                 .execute(
                     "INSERT INTO share_delegations (
                         round_id, wallet_id, bundle_index, proposal_id, share_index,
                         sent_to_urls, nullifier, confirmed, submit_at, created_at
-                     ) VALUES ('round', ?1, 0, ?2, ?3, '[]', X'00', 1, 1, 1)",
-                    rusqlite::params![wallet, proposal_id, share_index],
+                     ) VALUES ('round', ?1, 0, ?2, ?3, ?4, X'00', 1, 1, 1)",
+                    rusqlite::params![wallet, proposal_id, share_index, sent_to_urls],
                 )
                 .unwrap();
         }
         drop(db);
 
-        let progress = round_progress(&paths, Profile::Testnet, "round", true).unwrap();
+        let helper_servers = ["helper-a", "helper-b", "helper-c"].map(|url| ServiceEndpointView {
+            url: url.to_string(),
+            label: url.to_string(),
+        });
+        let progress =
+            round_progress(&paths, Profile::Testnet, "round", true, &helper_servers).unwrap();
         assert_eq!(progress.vote_count, 2);
         assert_eq!(progress.confirmed_vote_count, 2);
         assert_eq!(progress.required_share_count, 5);
-        assert_eq!(progress.submitted_share_count, 4);
+        assert_eq!(progress.submitted_share_count, 3);
     }
 
     #[test]

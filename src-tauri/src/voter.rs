@@ -19,7 +19,7 @@ use zcash_voting::{
     round::VotingDb,
     share_policy::{
         is_last_moment, last_moment_buffer_seconds, plan_share_submissions,
-        share_submission_random_bytes_required,
+        share_submission_random_bytes_required, share_submission_target_count,
     },
     vote::{
         commit_batch, recover_signed_commitments, CommittedVote, DraftVote, SignedVoteCommitment,
@@ -844,7 +844,8 @@ async fn submit_missing_shares(
     if server_urls.is_empty() {
         return Err("authenticated config has no helper servers".to_string());
     }
-    let existing = recorded_share_indices(
+    let target_count = share_submission_target_count(server_urls.len());
+    let existing = recorded_share_deliveries(
         paths,
         profile,
         &round.round_id,
@@ -878,10 +879,13 @@ async fn submit_missing_shares(
         &server_entropy,
     )
     .map_err(|error| format!("plan helper share submissions failed: {error}"))?;
-    let mut submitted_count = existing.len() as u32;
+    let mut submitted_count = 0u32;
     for (payload, plan) in commitment.share_payloads.iter().zip(plans) {
         let share_index = payload.enc_share.share_index;
-        if existing.contains(&share_index) {
+        let recorded = existing.get(&share_index);
+        let mut accepted = configured_recorded_servers(recorded.map(Vec::as_slice), &server_urls);
+        if accepted.len() >= target_count {
+            submitted_count = submitted_count.saturating_add(1);
             continue;
         }
         let wire = VoteShareWire::from_payload(payload, Some(vc_position), plan.submit_at)
@@ -895,48 +899,62 @@ async fn submit_missing_shares(
                 candidates.push(server.clone());
             }
         }
-        let mut accepted = Vec::new();
+        let mut attempted = HashSet::new();
+        let mut newly_accepted = Vec::new();
         for server in candidates {
-            if accepted.len() >= plan.target_count as usize {
+            if accepted.len() >= target_count {
                 break;
             }
-            if chain::submit_share(client, &server, &body).await.is_ok() {
-                accepted.push(server);
+            if accepted.contains(&server) || !attempted.insert(server.clone()) {
+                continue;
+            }
+            if chain::submit_share(client, &server, &body).await.is_ok()
+                && accepted.insert(server.clone())
+            {
+                newly_accepted.push(server);
             }
         }
-        if accepted.len() < plan.target_count as usize {
+        if !newly_accepted.is_empty() {
+            let db = open_db(paths, profile)?;
+            let recovered =
+                CommittedVote::recover(&db, &round.round_id, bundle_index, commitment.proposal_id)
+                    .map_err(|error| format!("recover vote for share recording failed: {error}"))?;
+            if recorded.is_some() {
+                recovered
+                    .add_sent_servers(&db, share_index, &newly_accepted)
+                    .map_err(|error| format!("update helper share submission failed: {error}"))?;
+            } else {
+                recovered
+                    .record_share(&db, share_index, &newly_accepted, plan.submit_at)
+                    .map_err(|error| format!("record helper share submission failed: {error}"))?;
+            }
+        }
+        if accepted.len() < target_count {
             return Err(format!(
                 "only {} of {} required helpers accepted share {share_index} for proposal {}; retry to resume safely",
                 accepted.len(),
-                plan.target_count,
+                target_count,
                 commitment.proposal_id,
             ));
         }
-        let db = open_db(paths, profile)?;
-        let recovered =
-            CommittedVote::recover(&db, &round.round_id, bundle_index, commitment.proposal_id)
-                .map_err(|error| format!("recover vote for share recording failed: {error}"))?;
-        recovered
-            .record_share(&db, share_index, &accepted, plan.submit_at)
-            .map_err(|error| format!("record helper share submission failed: {error}"))?;
         submitted_count = submitted_count.saturating_add(1);
     }
     Ok(submitted_count)
 }
 
-fn recorded_share_indices(
+fn recorded_share_deliveries(
     paths: &ProfilePaths,
     profile: Profile,
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
-) -> Result<HashSet<u32>, String> {
+) -> Result<BTreeMap<u32, Vec<String>>, String> {
     let db = open_db(paths, profile)?;
     let wallet = db.wallet_id();
     let conn = db.conn();
     let mut statement = conn
         .prepare(
-            "SELECT share_index FROM share_delegations
+            "SELECT share_index, sent_to_urls FROM share_delegations
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
         )
@@ -949,10 +967,29 @@ fn recorded_share_indices(
                 ":bundle_index": bundle_index,
                 ":proposal_id": proposal_id,
             },
-            |row| row.get::<_, u32>(0),
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|error| format!("query helper share recovery state failed: {error}"))?;
-    rows.map(|row| row.map_err(|error| format!("decode helper share row failed: {error}")))
+    let mut deliveries = BTreeMap::new();
+    for row in rows {
+        let (share_index, sent_to_urls) =
+            row.map_err(|error| format!("decode helper share row failed: {error}"))?;
+        let sent_to_urls = serde_json::from_str(&sent_to_urls)
+            .map_err(|error| format!("decode helper share server list failed: {error}"))?;
+        deliveries.insert(share_index, sent_to_urls);
+    }
+    Ok(deliveries)
+}
+
+fn configured_recorded_servers(
+    recorded: Option<&[String]>,
+    configured: &[String],
+) -> HashSet<String> {
+    recorded
+        .unwrap_or_default()
+        .iter()
+        .filter(|server| configured.contains(server))
+        .cloned()
         .collect()
 }
 
@@ -1076,5 +1113,61 @@ mod tests {
         let mut changed_proposal = original;
         changed_proposal.proposals[0].options[0].label = "Changed choice".to_string();
         assert!(validate_stored_round(&stored, &changed_proposal).is_err());
+    }
+
+    #[test]
+    fn retry_reuses_persisted_helper_acceptances() {
+        let root = std::env::temp_dir().join(format!(
+            "custody-voter-helper-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = crate::storage::profile_paths(&root, Profile::Testnet).unwrap();
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        let wallet = db.wallet_id().to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO rounds (
+                    round_id, wallet_id, network, snapshot_height, ea_pk, nc_root,
+                    nullifier_imt_root, created_at
+                 ) VALUES ('round', ?1, 'testnet', 1, X'00', X'00', X'00', 1)",
+                [&wallet],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (
+                    round_id, wallet_id, bundle_index, total_note_value, van_leaf_position
+                 ) VALUES ('round', ?1, 0, 0, 7)",
+                [&wallet],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO share_delegations (
+                    round_id, wallet_id, bundle_index, proposal_id, share_index,
+                    sent_to_urls, nullifier, confirmed, submit_at, created_at
+                 ) VALUES ('round', ?1, 0, 1, 0, '[\"https://helper-a\"]', X'00', 0, 1, 1)",
+                [&wallet],
+            )
+            .unwrap();
+        drop(db);
+
+        let deliveries =
+            recorded_share_deliveries(&paths, Profile::Testnet, "round", 0, 1).unwrap();
+        let configured = vec![
+            "https://helper-a".to_string(),
+            "https://helper-b".to_string(),
+            "https://helper-c".to_string(),
+        ];
+        let mut accepted =
+            configured_recorded_servers(deliveries.get(&0).map(Vec::as_slice), &configured);
+        assert_eq!(accepted, HashSet::from(["https://helper-a".to_string()]));
+
+        accepted.insert("https://helper-b".to_string());
+        assert_eq!(
+            accepted.len(),
+            share_submission_target_count(configured.len())
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

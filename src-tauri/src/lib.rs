@@ -56,7 +56,13 @@ async fn list_rounds(
             if let Some(stored_round) = manifest.rounds.get(&round.round_id) {
                 voter::validate_stored_round(stored_round, &round)?;
             }
-            let progress = round_progress(&paths, profile, &round.round_id, stored)?;
+            let progress = round_progress(
+                &paths,
+                profile,
+                &round.round_id,
+                stored,
+                &round.vote_servers,
+            )?;
             Ok(RoundCard {
                 round,
                 progress,
@@ -99,7 +105,13 @@ async fn get_round_workspace(
     };
     let stored = manifest.rounds.get(&round_id);
     Ok(RoundWorkspace {
-        progress: round_progress(&paths, profile, &round_id, stored.is_some())?,
+        progress: round_progress(
+            &paths,
+            profile,
+            &round_id,
+            stored.is_some(),
+            &round.vote_servers,
+        )?,
         target_json: stored.map(|round| round.target_json.clone()),
         capability_digest: stored.and_then(|round| round.capability_digest.clone()),
         votes: vote_records(&paths, profile, &round_id)?,
