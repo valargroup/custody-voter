@@ -182,7 +182,7 @@ fn rebuild_tree(
     round_id: &str,
 ) -> Result<(MemoryTreeServer, Vec<(u32, u32)>), String> {
     let wallet = db.wallet_id();
-    let (initial_vans, current_positions, vote_keys) = {
+    let (initial_vans, mut current_positions, vote_keys) = {
         let conn = db.conn();
         let mut bundle_statement = conn
             .prepare(
@@ -272,6 +272,12 @@ fn rebuild_tree(
             decode_field(&commitment.vote_commitment, "demo vote commitment")?,
         )
         .map_err(|error| format!("append demo vote leaves failed: {error:?}"))?;
+        let current_position = current_positions
+            .iter_mut()
+            .find(|(index, _)| *index == bundle_index)
+            .ok_or_else(|| format!("demo vote references unknown bundle {bundle_index}"))?;
+        current_position.1 = u32::try_from(expected_van_position)
+            .map_err(|_| "demo VAN position exceeds u32".to_string())?;
     }
     tree.checkpoint(1)
         .map_err(|error| format!("checkpoint demo vote tree failed: {error:?}"))?;
@@ -341,7 +347,7 @@ mod tests {
 
     #[test]
     #[ignore = "generates a full zero-knowledge vote proof"]
-    fn demo_generates_and_confirms_a_real_vote_proof() {
+    fn demo_generates_and_confirms_sequential_vote_proofs() {
         let round = round_snapshot();
         let hotkey = generate_random_voting_hotkey(Profile::Demo.network()).unwrap();
         let capability = capability_json(&hotkey).unwrap();
@@ -360,7 +366,7 @@ mod tests {
         )
         .unwrap();
         confirm_delegations(&db, &round.round_id).unwrap();
-        let witness = witness(&db, &round.round_id, 0).unwrap();
+        let initial_witness = witness(&db, &round.round_id, 0).unwrap();
         let signed = commit_batch(
             &db,
             &round.round_id,
@@ -372,7 +378,7 @@ mod tests {
                 vc_tree_position: 0,
                 single_share: true,
             }],
-            &witness,
+            &initial_witness,
             VoteSigner::hotkey(&hotkey),
             &NoopProgressReporter,
         )
@@ -381,5 +387,27 @@ mod tests {
         let (tx_hash, vc_position) = confirm_vote(&db, &round.round_id, 0, commitment).unwrap();
         assert_eq!(tx_hash.len(), 64);
         assert_eq!(vc_position, 3);
+        let next_witness = witness(&db, &round.round_id, 0).unwrap();
+        assert_eq!(next_witness.position, 2);
+        let second = commit_batch(
+            &db,
+            &round.round_id,
+            0,
+            &[DraftVote {
+                proposal_id: 2,
+                choice: 0,
+                num_options: 2,
+                vc_tree_position: 0,
+                single_share: true,
+            }],
+            &next_witness,
+            VoteSigner::hotkey(&hotkey),
+            &NoopProgressReporter,
+        )
+        .unwrap();
+        let commitment = second.commitments.first().unwrap();
+        let (_, vc_position) = confirm_vote(&db, &round.round_id, 0, commitment).unwrap();
+        assert_eq!(vc_position, 5);
+        assert_eq!(witness(&db, &round.round_id, 0).unwrap().position, 4);
     }
 }
