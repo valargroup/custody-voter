@@ -18,6 +18,7 @@ The hotkey is stored in the operating-system credential store. The React UI rece
 ## Recovery guarantees
 
 - A target that already exists is never silently replaced if its Keychain hotkey is missing.
+- A newly imported custody payload is removed from the voting database if manifest persistence fails. An interrupted prior import remains visible as incomplete and can be finalized by importing the same payload again.
 - Vote proof and signature recovery data are persisted before broadcast.
 - Repeating a vote action recovers the same persisted commitment when the choice matches; a conflicting choice is rejected.
 - Helper acknowledgements are persisted before incomplete delivery is reported, so retries retain acceptances from earlier attempts.

@@ -225,6 +225,7 @@ pub fn round_progress(
     profile: Profile,
     round_id: &str,
     target_ready: bool,
+    capability_ready: bool,
     helper_servers: &[ServiceEndpointView],
 ) -> Result<RoundProgress, String> {
     if !paths.database.exists() {
@@ -329,7 +330,7 @@ pub fn round_progress(
     let (bundle_count, confirmed_bundle_count, delegated_value) = bundle_stats.unwrap_or_default();
     Ok(RoundProgress {
         target_ready,
-        capability_imported: bundle_count > 0,
+        capability_imported: capability_ready && bundle_count > 0,
         bundle_count: to_u32(bundle_count, "bundle count")?,
         confirmed_bundle_count: to_u32(confirmed_bundle_count, "confirmed bundle count")?,
         delegated_ballots: to_u64(delegated_value, "delegated value")? / BALLOT_DIVISOR,
@@ -1005,8 +1006,27 @@ mod tests {
             url: url.to_string(),
             label: url.to_string(),
         });
-        let progress =
-            round_progress(&paths, Profile::Testnet, "round", true, &helper_servers).unwrap();
+        let interrupted = round_progress(
+            &paths,
+            Profile::Testnet,
+            "round",
+            true,
+            false,
+            &helper_servers,
+        )
+        .unwrap();
+        assert!(!interrupted.capability_imported);
+
+        let progress = round_progress(
+            &paths,
+            Profile::Testnet,
+            "round",
+            true,
+            true,
+            &helper_servers,
+        )
+        .unwrap();
+        assert!(progress.capability_imported);
         assert_eq!(progress.vote_count, 2);
         assert_eq!(progress.confirmed_vote_count, 2);
         assert_eq!(progress.required_share_count, 5);

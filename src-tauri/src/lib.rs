@@ -53,6 +53,11 @@ async fn list_rounds(
         .into_iter()
         .map(|round| {
             let stored = manifest.rounds.contains_key(&round.round_id);
+            let capability_ready = manifest
+                .rounds
+                .get(&round.round_id)
+                .and_then(|round| round.capability_digest.as_ref())
+                .is_some();
             if let Some(stored_round) = manifest.rounds.get(&round.round_id) {
                 voter::validate_stored_round(stored_round, &round)?;
             }
@@ -61,6 +66,7 @@ async fn list_rounds(
                 profile,
                 &round.round_id,
                 stored,
+                capability_ready,
                 &round.vote_servers,
             )?;
             Ok(RoundCard {
@@ -110,6 +116,9 @@ async fn get_round_workspace(
             profile,
             &round_id,
             stored.is_some(),
+            stored
+                .and_then(|round| round.capability_digest.as_ref())
+                .is_some(),
             &round.vote_servers,
         )?,
         target_json: stored.map(|round| round.target_json.clone()),

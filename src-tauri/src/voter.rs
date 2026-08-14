@@ -139,6 +139,10 @@ pub async fn import_capability(
     validate_stored_round(stored, &round)?;
     let hotkey = load_hotkey(profile, &round.round_id)?;
     let db = open_db(paths, profile)?;
+    let had_imported_capability = db
+        .get_bundle_count(&round.round_id)
+        .map_err(|error| format!("load existing custody payload state failed: {error}"))?
+        > 0;
     let digest = import_delegation_capability(
         &db,
         &capability_bytes,
@@ -159,7 +163,13 @@ pub async fn import_capability(
         .expect("stored round was checked above");
     stored.snapshot = round.clone();
     stored.capability_digest = Some(digest.clone());
-    write_manifest(paths, &manifest)?;
+    persist_capability_manifest(
+        paths,
+        &manifest,
+        &db,
+        &round.round_id,
+        had_imported_capability,
+    )?;
 
     if profile.is_demo() {
         // The demo keeps confirmation as an explicit customer-visible step.
@@ -167,6 +177,29 @@ pub async fn import_capability(
         refresh_delegations_once(client, &db, &round).await?;
     }
     import_result(&db, &round.round_id, digest)
+}
+
+fn persist_capability_manifest(
+    paths: &ProfilePaths,
+    manifest: &crate::model::ProfileManifest,
+    db: &VotingDb,
+    round_id: &str,
+    had_imported_capability: bool,
+) -> Result<(), String> {
+    if let Err(error) = write_manifest(paths, manifest) {
+        if had_imported_capability {
+            return Err(format!(
+                "{error}; retry the same custody payload to finish local recovery"
+            ));
+        }
+        return match db.delete_round(round_id) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; rolling back the imported custody payload also failed: {rollback_error}"
+            )),
+        };
+    }
+    Ok(())
 }
 
 pub async fn refresh_delegations(
@@ -1168,6 +1201,50 @@ mod tests {
             accepted.len(),
             share_submission_target_count(configured.len())
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_failure_rolls_back_new_capability_database_state() {
+        let root = std::env::temp_dir().join(format!(
+            "custody-voter-capability-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = crate::storage::profile_paths(&root, Profile::Testnet).unwrap();
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        let wallet = db.wallet_id().to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO rounds (
+                    round_id, wallet_id, network, snapshot_height, ea_pk, nc_root,
+                    nullifier_imt_root, created_at
+                 ) VALUES ('round', ?1, 'testnet', 1, X'00', X'00', X'00', 1)",
+                [&wallet],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (
+                    round_id, wallet_id, bundle_index, total_note_value, van_leaf_position
+                 ) VALUES ('round', ?1, 0, 0, 7)",
+                [&wallet],
+            )
+            .unwrap();
+        std::fs::create_dir(&paths.manifest).unwrap();
+
+        let error = persist_capability_manifest(
+            &paths,
+            &crate::model::ProfileManifest::empty(Profile::Testnet),
+            &db,
+            "round",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("replace file failed"));
+        assert_eq!(db.get_bundle_count("round").unwrap(), 0);
+        assert!(db.round("round").unwrap().is_none());
+        drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
