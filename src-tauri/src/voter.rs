@@ -340,14 +340,6 @@ pub async fn cast_votes(
 ) -> Result<CastVotesResult, String> {
     require_round_context(profile, &round)?;
     validate_choices(&round, &choices)?;
-    if !profile.is_demo() {
-        if !round.is_active {
-            return Err(format!("round is {}, not active", round.status_label));
-        }
-        if round.vote_end_time <= unix_seconds()? {
-            return Err("the voting window has ended".to_string());
-        }
-    }
 
     let manifest = read_manifest(&paths, profile)?;
     let stored = manifest
@@ -425,6 +417,9 @@ pub async fn cast_votes(
                         choice.proposal_id
                     ));
                 }
+            }
+            if !profile.is_demo() {
+                ensure_vote_can_continue(profile, &round, existing.as_ref(), unix_seconds()?)?;
             }
 
             let single_share = if profile.is_demo() {
@@ -776,6 +771,7 @@ async fn finish_live_vote(
     let mut tx_hash = existing.as_ref().and_then(|vote| vote.tx_hash.clone());
     let mut vc_position = existing.as_ref().and_then(|vote| vote.vc_tree_position);
     if tx_hash.is_none() {
+        ensure_vote_can_continue(profile, round, None, unix_seconds()?)?;
         emit_progress(
             app,
             &round.round_id,
@@ -856,6 +852,27 @@ async fn finish_live_vote(
     )
     .await?;
     Ok((tx_hash, vc_position, submitted_shares))
+}
+
+fn ensure_vote_can_continue(
+    profile: Profile,
+    round: &RoundSnapshot,
+    existing: Option<&ExistingVote>,
+    now: u64,
+) -> Result<(), String> {
+    if profile.is_demo() || existing.and_then(|vote| vote.tx_hash.as_ref()).is_some() {
+        return Ok(());
+    }
+    if !round.is_active {
+        return Err(format!(
+            "round is {}, so a new vote cannot be created or broadcast",
+            round.status_label
+        ));
+    }
+    if round.vote_end_time <= now {
+        return Err("the voting window ended before this vote was broadcast".to_string());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1146,6 +1163,38 @@ mod tests {
         let mut changed_proposal = original;
         changed_proposal.proposals[0].options[0].label = "Changed choice".to_string();
         assert!(validate_stored_round(&stored, &changed_proposal).is_err());
+    }
+
+    #[test]
+    fn closed_round_allows_only_submitted_votes_to_resume() {
+        let mut round = crate::demo::round_snapshot();
+        round.is_active = false;
+        round.status_label = "Finalized".to_string();
+        round.vote_end_time = 100;
+        let submitted = ExistingVote {
+            choice: 0,
+            tx_hash: Some("submitted-hash".to_string()),
+            vc_tree_position: None,
+        };
+        let signed_only = ExistingVote {
+            choice: 0,
+            tx_hash: None,
+            vc_tree_position: None,
+        };
+
+        assert!(ensure_vote_can_continue(Profile::Testnet, &round, Some(&submitted), 101).is_ok());
+        assert!(
+            ensure_vote_can_continue(Profile::Testnet, &round, Some(&signed_only), 101).is_err()
+        );
+        assert!(ensure_vote_can_continue(Profile::Testnet, &round, None, 101).is_err());
+
+        round.is_active = true;
+        assert!(ensure_vote_can_continue(Profile::Testnet, &round, Some(&submitted), 101).is_ok());
+        assert!(
+            ensure_vote_can_continue(Profile::Testnet, &round, Some(&signed_only), 101)
+                .unwrap_err()
+                .contains("voting window ended")
+        );
     }
 
     #[test]

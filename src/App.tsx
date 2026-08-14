@@ -494,23 +494,35 @@ function App() {
           workspace.progress.submittedShareCount >= workspace.progress.requiredShareCount)),
   );
   const voteComplete = votesConfirmed && helperSharesDelivered;
+  const canResumeSubmittedVote = Boolean(
+    workspace && workspace.progress.submittedVoteCount > 0,
+  );
   const voteReady = Boolean(
     workspace &&
       delegationReady &&
       completeChoiceCount === workspace.round.proposals.length &&
       reviewed &&
       !voteComplete &&
-      (workspace.round.isActive || profile === "demo"),
+      (workspace.round.isActive || profile === "demo" || canResumeSubmittedVote),
   );
-  const voteActionLabel = workspace?.progress.voteCount
-    ? workspace.progress.confirmedVoteCount < expectedVoteCount
-      ? workspace.progress.submittedVoteCount < expectedVoteCount
+  const voteActionLabel = (() => {
+    if (workspace && !workspace.round.isActive && canResumeSubmittedVote) {
+      return workspace.progress.confirmedVoteCount < workspace.progress.submittedVoteCount
+        ? "Resume and confirm submitted votes"
+        : "Finish helper share delivery";
+    }
+    if (workspace?.progress.voteCount) {
+      if (workspace.progress.confirmedVoteCount >= expectedVoteCount) {
+        return "Finish helper share delivery";
+      }
+      return workspace.progress.submittedVoteCount < expectedVoteCount
         ? "Resume vote submission"
-        : "Resume and confirm vote"
-      : "Finish helper share delivery"
-    : profile === "demo"
+        : "Resume and confirm vote";
+    }
+    return profile === "demo"
       ? "Run local proof rehearsal"
       : "Generate proofs and cast vote";
+  })();
   const receiptTransactions =
     voteResult?.transactions ??
     workspace?.votes.flatMap((vote) =>
