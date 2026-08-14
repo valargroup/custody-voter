@@ -89,7 +89,14 @@ pub fn generate_target(
             reused: true,
         });
     }
-    if !round_accepts_setup(profile, &round) {
+    let now = unix_seconds()?;
+    if !round_accepts_setup(profile, &round, now) {
+        if !profile.is_demo() && round.vote_end_time <= now {
+            return Err(
+                "the voting deadline has passed and this round no longer accepts new voting targets"
+                    .to_string(),
+            );
+        }
         return Err(format!(
             "round is {} and no longer accepts new voting targets",
             round.status_label.to_lowercase()
@@ -1117,8 +1124,14 @@ pub fn validate_stored_round(stored: &StoredRound, fresh: &RoundSnapshot) -> Res
     Ok(())
 }
 
-fn round_accepts_setup(profile: Profile, round: &RoundSnapshot) -> bool {
-    if profile.is_demo() || round.is_active {
+fn round_accepts_setup(profile: Profile, round: &RoundSnapshot, now: u64) -> bool {
+    if profile.is_demo() {
+        return true;
+    }
+    if round.vote_end_time <= now {
+        return false;
+    }
+    if round.is_active {
         return true;
     }
     matches!(
@@ -1177,6 +1190,24 @@ mod tests {
         let mut changed_proposal = original;
         changed_proposal.proposals[0].options[0].label = "Changed choice".to_string();
         assert!(validate_stored_round(&stored, &changed_proposal).is_err());
+    }
+
+    #[test]
+    fn new_target_setup_requires_a_future_voting_deadline() {
+        let mut round = crate::demo::round_snapshot();
+        round.vote_end_time = 100;
+
+        assert!(round_accepts_setup(Profile::Testnet, &round, 99));
+        assert!(!round_accepts_setup(Profile::Testnet, &round, 100));
+
+        round.is_active = false;
+        round.status = "pending".to_string();
+        assert!(round_accepts_setup(Profile::Testnet, &round, 99));
+        assert!(!round_accepts_setup(Profile::Testnet, &round, 100));
+
+        round.status = "finalized".to_string();
+        assert!(!round_accepts_setup(Profile::Testnet, &round, 99));
+        assert!(round_accepts_setup(Profile::Demo, &round, 100));
     }
 
     #[test]
