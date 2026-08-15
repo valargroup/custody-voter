@@ -17,7 +17,7 @@ jobs:
   build:
     name: Build, sign, and notarize DMG
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     environment:
       name: macos-release
     permissions:
@@ -130,7 +130,7 @@ jobs:
 
           printf 'signing_identity=%s\n' "$SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
 
-      - name: Build, sign, notarize, and staple the universal DMG
+      - name: Build, sign, notarize, and staple the universal app
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.signing_identity }}
@@ -141,9 +141,13 @@ jobs:
           set -euo pipefail
           npm run tauri -- build --target universal-apple-darwin --bundles app,dmg
 
-      - name: Verify the signed release
+      - name: Notarize, staple, and verify the signed DMG
         id: artifact
         shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
 
@@ -165,6 +169,14 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           spctl --assess --type execute --verbose=2 "$APP_PATH"
           xcrun stapler validate "$APP_PATH"
+
+          # Tauri creates the DMG after it notarizes the app, so the image needs its own ticket.
+          xcrun notarytool submit "$DMG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG_PATH"
           xcrun stapler validate "$DMG_PATH"
           spctl --assess \
             --type open \
