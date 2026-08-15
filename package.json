@@ -1,7 +1,7 @@
 {
   "name": "custody-voter",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Customer application for custody-delegated Zcash voting",
   "license": "MIT OR Apache-2.0",
   "type": "module",
