@@ -1,6 +1,6 @@
 [package]
 name = "custody-voter"
-version = "0.1.0"
+version = "1.0.1"
 description = "Customer application for custody-delegated Zcash voting"
 authors = ["Valar"]
 edition = "2021"

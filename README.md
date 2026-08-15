@@ -113,11 +113,40 @@ cd src-tauri
 cargo test test_custodian::tests::recovers_account_zero_and_scans_real_testnet_blocks -- --ignored --exact
 ```
 
+## Signed macOS releases
+
+The `Signed macOS release` GitHub Actions workflow builds the exact commit named by a version tag as a production-optimized universal macOS application. It signs the app with Developer ID, submits it to Apple's notarization service, staples the notarization ticket, verifies both the app and DMG with Apple's command-line tools, and then publishes these release assets:
+
+- `Custody-Voter-macos.dmg`
+- `Custody-Voter-macos.dmg.sha256`
+
+Pushing a tag such as `v1.0.1` starts the workflow. The tag must exactly match `v` plus the version in `src-tauri/tauri.conf.json`. An active repository ruleset limits creating, moving, or deleting matching release tags to the designated release operator. The build also targets the protected `macos-release` environment, which accepts only version tags and requires approval before exposing its secrets. If a run is interrupted, rerun the original tag-triggered workflow from GitHub Actions; it resumes an existing draft. Do not add a branch-selectable manual trigger because that would let untrusted workflow code request the signing environment.
+
+The signing job has read-only repository permissions and does not persist checkout credentials. It passes the verified DMG and checksum through GitHub's artifact service to a separate publication job. Only that publication job has `contents: write`; it has no Apple secrets and does not check out or execute repository code. The workflow rechecks that the remote tag still names the built commit before touching a release and again immediately before publication. Versions with a prerelease suffix are published as prereleases, and GitHub determines which stable release is latest. Assets are uploaded to a draft first and the release is published only after both uploads succeed. Already-published releases and their assets are left unchanged. Release-asset visibility follows the repository's GitHub visibility.
+
+The protected `macos-release` environment requires these encrypted Actions secrets. Keep them environment-scoped; repository-scoped copies would be available to unrelated workflows.
+
+- `APPLE_CERTIFICATE`: base64-encoded PKCS #12 archive containing the Developer ID Application certificate and its private key
+- `APPLE_CERTIFICATE_PASSWORD`: export password for that PKCS #12 archive
+- `APPLE_ID`: Apple Account email used for notarization
+- `APPLE_PASSWORD`: a dedicated Apple app-specific password, never the normal Apple Account password
+- `APPLE_TEAM_ID`: Apple Developer Program team identifier
+
+The certificate is imported into a temporary CI keychain and removed at the end of the job. Keep the original signing key in the macOS Keychain, revoke the app-specific password if CI access is no longer needed, and revoke the Developer ID certificate immediately if its private key might have been exposed. Do not place any of these values in repository files or workflow logs.
+
+After downloading a release on macOS, its checksum and Apple assessment can be checked with:
+
+```sh
+shasum -a 256 -c Custody-Voter-macos.dmg.sha256
+spctl --assess --type open --context context:primary-signature --verbose=2 Custody-Voter-macos.dmg
+xcrun stapler validate Custody-Voter-macos.dmg
+```
+
 ## Current scope
 
 - The first release is a desktop app. There is no hosted web version because a browser would put voting-secret storage and native proof dependencies behind a weaker boundary.
 - Mainnet and Testnet use the currently pinned Valar voting configuration revisions. Updating those trust anchors is an intentional source change and release event.
-- Distribution signing, notarization, and an update channel are deployment work. Local development and unsigned local bundles work without them.
+- GitHub release DMGs are signed and notarized for direct macOS distribution. An automatic update channel remains future deployment work.
 
 ## License
 
