@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "custody-voter"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "age",
  "base64 0.22.1",
