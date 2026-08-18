@@ -21,8 +21,8 @@ use zcash_voting::{
 
 use crate::model::{AppOption, AppProposal, Profile, RoundSnapshot, ServiceEndpointView};
 
-const MAINNET_CONFIG_SOURCE: &str = "https://raw.githubusercontent.com/valargroup/token-holder-voting-config/671f76403eea8aaf64a87cb484c4b0cdaea596db/prod/static-voting-config.json?checksum=sha256:c06f1dfa2f0a30b3614aefcf00ac7e31d61ebc3cf551b3031d1b194232d1056d";
-const TESTNET_CONFIG_SOURCE: &str = "https://raw.githubusercontent.com/valargroup/token-holder-voting-config/491e55306aa5c539a0314d30a8b2c51946b88b73/stage/static-voting-config.json?checksum=sha256:80890a6de9acc7293c3e2fabf870bb3e5755dbe0e69de4a59feb8f696134d4dc";
+const MAINNET_CONFIG_SOURCE: &str = "https://voting.valargroup.dev/pins/prod/fb62a56fae28debfdaa092f163cda0dab13295f87d25bbc4d0064d6ccdeb6943/static-voting-config.json?checksum=sha256:fb62a56fae28debfdaa092f163cda0dab13295f87d25bbc4d0064d6ccdeb6943";
+const TESTNET_CONFIG_SOURCE: &str = "https://voting.valargroup.dev/pins/stage/046758f8d1f1a74c7ea63461fd77101930c5df5817b74453ed81895c26bf988f/static-voting-config.json?checksum=sha256:046758f8d1f1a74c7ea63461fd77101930c5df5817b74453ed81895c26bf988f";
 const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHAIN_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(debug_assertions)]
@@ -899,6 +899,29 @@ mod tests {
         assert!(status_details("1").1);
         assert!(status_details("SESSION_STATUS_ACTIVE").1);
         assert!(!status_details("3").1);
+    }
+
+    #[test]
+    fn voting_config_sources_use_resilient_immutable_pins() {
+        for (source, environment, checksum) in [
+            (
+                MAINNET_CONFIG_SOURCE,
+                "prod",
+                "fb62a56fae28debfdaa092f163cda0dab13295f87d25bbc4d0064d6ccdeb6943",
+            ),
+            (
+                TESTNET_CONFIG_SOURCE,
+                "stage",
+                "046758f8d1f1a74c7ea63461fd77101930c5df5817b74453ed81895c26bf988f",
+            ),
+        ] {
+            let expected_url = format!(
+                "https://voting.valargroup.dev/pins/{environment}/{checksum}/static-voting-config.json"
+            );
+            let parsed = PinnedConfigSource::parse(source).unwrap();
+            assert_eq!(parsed.url, expected_url);
+            assert_eq!(source, format!("{expected_url}?checksum=sha256:{checksum}"));
+        }
     }
 
     #[test]
