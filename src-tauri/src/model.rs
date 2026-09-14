@@ -110,6 +110,7 @@ pub struct RoundProgress {
     pub confirmed_vote_count: u32,
     pub required_share_count: u32,
     pub submitted_share_count: u32,
+    pub confirmed_share_count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -200,6 +201,10 @@ pub struct VoteTransactionResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CastVotesResult {
+    pub outcome: String,
+    pub message: String,
+    pub shares_delivered: u32,
+    pub shares_confirmed: u32,
     pub demo: bool,
     pub proof_count: u32,
     pub transactions: Vec<VoteTransactionResult>,

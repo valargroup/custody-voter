@@ -6,13 +6,43 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zcash_voting::backend::orchard;
+use zcash_voting::backend::pasta_curves;
+use zcash_voting::backend::zcash_client_backend;
+use zcash_voting::backend::zcash_client_sqlite;
+use zcash_voting::backend::zcash_keys;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bip0039::{English, Mnemonic};
 use ff::PrimeField;
 use pasta_curves::pallas;
 use prost::Message;
-use rand::rngs::OsRng;
+use rand10::{rngs::StdRng, SeedableRng};
+// Wallet migrations require Clone. Cloning creates an independent CSPRNG;
+// it never duplicates a cryptographic random stream.
+struct WalletRng(StdRng);
+fn wallet_rng() -> WalletRng {
+    WalletRng(StdRng::from_rng(&mut rand10::rng()))
+}
+impl Clone for WalletRng {
+    fn clone(&self) -> Self {
+        wallet_rng()
+    }
+}
+impl rand10::TryRng for WalletRng {
+    type Error = std::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(rand10::Rng::next_u32(&mut self.0))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(rand10::Rng::next_u64(&mut self.0))
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        rand10::Rng::fill_bytes(&mut self.0, dst);
+        Ok(())
+    }
+}
+impl rand10::TryCryptoRng for WalletRng {}
 use reqwest::{Client, Url};
 use rusqlite::{Connection, OpenFlags};
 use secrecy::{ExposeSecret, SecretVec};
@@ -73,7 +103,7 @@ const LIGHTWALLETD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LIGHTWALLETD_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LIGHTWALLETD_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-type TestWalletDb = WalletDb<Connection, Network, SystemClock, OsRng>;
+type TestWalletDb = WalletDb<Connection, Network, SystemClock, WalletRng>;
 
 #[derive(Clone)]
 struct JobPaths {
@@ -665,16 +695,38 @@ fn recover_fully_signed_job(
 
 async fn broadcast_job(
     app: AppHandle,
-    client: Client,
+    _client: Client,
     paths: JobPaths,
     round: RoundSnapshot,
     mut job: TestCustodianJob,
 ) -> Result<TestCustodianResult, String> {
+    use zcash_voting::{
+        AdvanceDelegation, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionControl,
+        ChainSubmissionResult,
+    };
+    let db = Arc::new(open_provider_db(&paths)?);
+    let client = ChainSubmissionClient::with_transport(
+        db,
+        crate::voter::VotingWindowTransport {
+            inner: zcash_voting::HyperTransport::new(),
+            vote_end_time: round.vote_end_time,
+        },
+        crate::voter::chain_config(&round),
+    )
+    .map_err(|e| e.to_string())?;
+    let control = ChainSubmissionControl::new(0);
     for index in 0..job.signed_transactions.len() {
-        if job.signed_transactions[index].broadcast_accepted {
-            continue;
-        }
-        let entry = job.signed_transactions[index].clone();
+        let entry = &job.signed_transactions[index];
+        validate_transaction_entry(entry, &round.round_id)?;
+        let wire: DelegationSubmissionWire =
+            serde_json::from_str(&entry.body_json).map_err(|e| e.to_string())?;
+        let signature = decode_wire_bytes(&wire.spend_auth_sig, "spend_auth_sig")?;
+        let request = AdvanceDelegation::from_signature_bytes(
+            crate::voter::round_bytes(&round)?,
+            entry.bundle_index,
+            &signature,
+        )
+        .map_err(|e| e.to_string())?;
         emit_progress(
             &app,
             &round.round_id,
@@ -682,59 +734,33 @@ async fn broadcast_job(
             Some(entry.bundle_index),
             Some(job.bundle_count),
             None,
-            &format!(
-                "Broadcasting delegation bundle {} of {} to Testnet",
-                entry.bundle_index + 1,
-                job.bundle_count
-            ),
+            "Reconciling the signed Testnet delegation through the voting SDK",
         );
-        let already_committed =
-            match chain::get_tx_confirmation(&client, &round.vote_servers, &entry.tx_hash).await {
-                Ok(Some(confirmation)) if confirmation.code == 0 => true,
-                Ok(Some(confirmation)) => {
-                    return Err(if confirmation.log.trim().is_empty() {
-                        format!(
-                            "delegation transaction {} committed with code {}",
-                            entry.tx_hash, confirmation.code
-                        )
-                    } else {
-                        confirmation.log
-                    });
-                }
-                Ok(None) | Err(_) => false,
-            };
-        if !already_committed {
-            let result =
-                chain::submit_delegation(&client, &round.vote_servers, &entry.body_json).await?;
-            if !result.tx_hash.eq_ignore_ascii_case(&entry.tx_hash) {
+        let mut result = client
+            .advance_delegation_with_recovery(request, ChainRecoveryMode::ExactTree, &control)
+            .await
+            .map_err(|e| e.to_string())?;
+        for _ in 0..45 {
+            if !matches!(result, ChainSubmissionResult::Pending(_)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            result = client
+                .advance_delegation_with_recovery(request, ChainRecoveryMode::ExactTree, &control)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        match result {
+            ChainSubmissionResult::Confirmed(_) => {
+                job.signed_transactions[index].broadcast_accepted = true;
+                write_job(&paths, &job)?;
+            }
+            _ => {
                 return Err(format!(
-                    "vote chain returned transaction hash {}, expected {}",
-                    result.tx_hash, entry.tx_hash
-                ));
+                    "delegation is not confirmed yet; retry the same job to resume: {result:?}"
+                ))
             }
         }
-        let mark_paths = paths.clone();
-        let mark_round = round.clone();
-        let mark_target = job.target_json.clone();
-        let mark_birthday = job.wallet_birthday_height;
-        let mark_fingerprint = job.seed_fingerprint.clone();
-        let mark_hash = entry.tx_hash.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            mark_broadcast_accepted(
-                &mark_paths,
-                JobContext {
-                    round: &mark_round,
-                    target_json: &mark_target,
-                    wallet_birthday_height: mark_birthday,
-                    seed_fingerprint: &mark_fingerprint,
-                },
-                entry.bundle_index,
-                &mark_hash,
-            )
-        })
-        .await
-        .map_err(|error| format!("persist test custodian broadcast task failed: {error}"))??;
-        job.signed_transactions[index].broadcast_accepted = true;
     }
     emit_progress(
         &app,
@@ -794,35 +820,6 @@ fn finalize_capability(
     job.capability_json = Some(canonical_json);
     job.capability_digest = Some(digest);
     write_job(paths, job)
-}
-
-fn mark_broadcast_accepted(
-    paths: &JobPaths,
-    context: JobContext<'_>,
-    bundle_index: u32,
-    tx_hash: &str,
-) -> Result<(), String> {
-    let mut job = read_job(paths)?.ok_or_else(|| "test custodian job is missing".to_string())?;
-    validate_job(&job, context)?;
-    let entry = job
-        .signed_transactions
-        .get_mut(
-            usize::try_from(bundle_index).map_err(|_| "bundle index exceeds usize".to_string())?,
-        )
-        .ok_or_else(|| format!("test custodian bundle {bundle_index} is missing"))?;
-    if entry.tx_hash != tx_hash {
-        return Err("broadcast transaction hash conflicts with persisted job state".to_string());
-    }
-    let provider_db = open_provider_db(paths)?;
-    zcash_voting::delegate::record_submission(
-        &provider_db,
-        &context.round.round_id,
-        bundle_index,
-        tx_hash,
-    )
-    .map_err(|error| format!("record test delegation submission failed: {error}"))?;
-    entry.broadcast_accepted = true;
-    write_job(paths, &job)
 }
 
 fn result_from_job(job: &TestCustodianJob) -> Result<TestCustodianResult, String> {
@@ -983,7 +980,7 @@ fn sign_delegation_request(
     let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(request.alpha))
         .ok_or_else(|| "delegation randomizer is not a canonical Pallas scalar".to_string())?;
     let randomized = ask.randomize(&alpha);
-    let signature = randomized.sign(OsRng, &request.sighash);
+    let signature = randomized.sign(wallet_rng(), &request.sighash);
     Ok(((&signature).into(), request.sighash))
 }
 
@@ -1352,7 +1349,7 @@ fn open_wallet_readonly(path: &Path) -> Result<TestWalletDb, String> {
         connection,
         Network::Testnet,
         SystemClock,
-        OsRng,
+        wallet_rng(),
     ))
 }
 
@@ -1375,7 +1372,7 @@ fn open_wallet_database(path: &Path) -> Result<TestWalletDb, String> {
         connection,
         Network::Testnet,
         SystemClock,
-        OsRng,
+        wallet_rng(),
     ))
 }
 
@@ -1385,6 +1382,7 @@ fn open_provider_db(paths: &JobPaths) -> Result<VotingDb, String> {
         .parent()
         .ok_or_else(|| "test custodian voting database path has no parent".to_string())?;
     create_private_directory(parent)?;
+    crate::storage::prepare_database_upgrade(&paths.provider_database)?;
     let db = VotingDb::open_path(&paths.provider_database)
         .map_err(|error| format!("open test custodian voting database failed: {error}"))?;
     set_private_file_permissions(&paths.provider_database)?;

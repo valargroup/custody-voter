@@ -14,6 +14,9 @@ import type {
 } from "./types";
 
 export const api = {
+  setTrackingRound(profile: Profile, roundId: string | null) {
+    return invoke<void>("set_tracking_round", { profile, roundId });
+  },
   listRounds(profile: Profile) {
     return invoke<RoundCard[]>("list_rounds", { profile });
   },

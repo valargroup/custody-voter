@@ -66,11 +66,18 @@ stateDiagram-v2
     VotePersisted --> VoteSubmitted: Broadcast signed payload
     VoteSubmitted --> VoteConfirmed: Parse on-chain positions
     VoteConfirmed --> SharesSubmitted: Meet helper redundancy policy
+    SharesSubmitted --> SharesConfirmed: Track helper confirmation before vote end
     VotePersisted --> VotePersisted: Recover after interruption
     VoteSubmitted --> VoteSubmitted: Poll after uncertain confirmation
 ```
 
 The database is the recovery source of truth after a vote commitment is built. A retry never rebuilds a commitment with a different selection under the same bundle and proposal key.
+
+The application uses the published `zcash_voting` 5.0.0 Zakura backend. `RoundExecutor`, `RoundDriver`, and `ChainSubmissionClient` own submission, confirmation parsing, and durable recovery. Fresh custody proofs use the public `prepare_vote_work` / `persist_prepared_vote_work` APIs: v5.0.0's executor fresh-cast path requires the custodian-only `rho_signed` field, which canonical imported capabilities intentionally omit. The coordinator prepares only SDK-planned drafts after all delegations confirm, then advances one SDK dispatch per pass so recovered singleton work completes before newly unlocked proposals are prepared as batches.
+
+A selected authenticated workspace owns one cancellable `ShareTrackingDriver`. The frontend periodically refreshes the authenticated workspace and updates its helper context. Switching workspace, starting a foreground operation, restoring a backup, or resetting data drains the worker. Delivered and confirmed share counts are distinct; only confirmed shares complete the workflow. The offline demo injects local chain, tree, and helper transports and uses a simulated share clock.
+
+Schema versions 13 through 24 migrate through the SDK after a private consistent `.before-v5` snapshot. Unsupported nonempty databases are rejected before the SDK can reset them. The same guard applies to restored backups and provider databases.
 
 ## Network authentication
 
@@ -80,7 +87,7 @@ All remote requests run in Rust with TLS, connect and total timeouts, failover a
 
 ## Backup and restore
 
-An export checkpoints SQLite, reads every round hotkey from Keychain, serializes one profile, and encrypts the envelope with age scrypt passphrase encryption. Sensitive serialized fields are zeroized when the envelope is dropped.
+An export takes a consistent SQLite backup snapshot, reads every round hotkey from Keychain, serializes one profile, and encrypts the envelope with age scrypt passphrase encryption. Sensitive serialized fields are zeroized when the envelope is dropped.
 
 Restore performs these checks before activation:
 
