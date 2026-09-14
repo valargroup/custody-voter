@@ -26,7 +26,7 @@ const ALL_PROFILES: Array<{ id: Profile; label: string; eyebrow: string }> = [
 const PROFILES = ALL_PROFILES.filter(
   (item) => __LOCAL_DEMO_ENABLED__ || item.id !== "demo",
 );
-const DEFAULT_PROFILE: Profile = __LOCAL_DEMO_ENABLED__ ? "demo" : "testnet";
+const DEFAULT_PROFILE: Profile = "testnet";
 
 type BusyAction =
   | "rounds"
@@ -336,11 +336,7 @@ function App() {
     );
     if (!result) return;
     setVoteResult(result);
-    await refreshAll(
-      result.demo
-        ? "The local rehearsal completed with real proofs. No transaction left this computer."
-        : "Every vote was confirmed and its encrypted helper shares were submitted.",
-    );
+    await refreshAll(result.message);
   };
 
   const handleCapabilityFile = async (file: File | undefined) => {
@@ -489,16 +485,56 @@ function App() {
   );
   const helperSharesDelivered = Boolean(
     workspace &&
-      (profile === "demo" ||
-        (workspace.progress.requiredShareCount > 0 &&
-          workspace.progress.submittedShareCount >= workspace.progress.requiredShareCount)),
+      workspace.progress.requiredShareCount > 0 &&
+      workspace.progress.submittedShareCount >= workspace.progress.requiredShareCount,
   );
-  const voteComplete = votesConfirmed && helperSharesDelivered;
+  const helperSharesConfirmed = Boolean(workspace && workspace.progress.requiredShareCount > 0 &&
+    workspace.progress.confirmedShareCount >= workspace.progress.requiredShareCount);
+  const voteComplete = votesConfirmed && helperSharesConfirmed;
+  const trackingRoundId = workspace?.round.authenticated && workspace.progress.voteCount > 0 && !voteComplete
+    && !busy ? workspace.round.roundId : null;
+  useEffect(() => {
+    let cancelled = false;
+    let refreshing = false;
+    const update = async () => {
+      if (cancelled || refreshing || !trackingRoundId) return;
+      refreshing = true;
+      try {
+        const next = await api.getWorkspace(profile, trackingRoundId);
+        if (cancelled) return;
+        setWorkspace(next);
+        await api.setTrackingRound(profile, next.round.authenticated ? trackingRoundId : null);
+      } catch (caught) {
+        if (!cancelled) setError(errorMessage(caught));
+      } finally { refreshing = false; }
+    };
+    void api.setTrackingRound(profile, trackingRoundId).catch(caught => {
+      if (!cancelled) setError(errorMessage(caught));
+    });
+    const timer = trackingRoundId ? window.setInterval(() => void update(), 10_000) : undefined;
+    let unlisten: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+    void listen<string>("share-tracking-error", ({ payload }) => {
+      if (!cancelled && trackingRoundId && payload.includes(trackingRoundId)) setError(payload);
+    }).then(stop => { if (cancelled) stop(); else unlistenError = stop; });
+    void listen<string>("share-progress", ({ payload }) => {
+      if (payload === trackingRoundId) void update();
+    }).then(stop => { if (cancelled) stop(); else unlisten = stop; });
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      unlisten?.();
+      unlistenError?.();
+      void api.setTrackingRound(profile, null).catch(() => {});
+    };
+  }, [profile, trackingRoundId]);
+
   const canResumeSubmittedVote = Boolean(
     workspace && workspace.progress.submittedVoteCount > 0,
   );
   const voteReady = Boolean(
     workspace &&
+      workspace.round.authenticated &&
       delegationReady &&
       completeChoiceCount === workspace.round.proposals.length &&
       reviewed &&
@@ -1162,6 +1198,11 @@ function App() {
                   })}
                 </div>
 
+                {workspace.progress.voteCount > 0 && <p role="status">
+                  {workspace.progress.confirmedVoteCount}/{expectedVoteCount} votes confirmed · {workspace.progress.submittedShareCount}/{workspace.progress.requiredShareCount} shares delivered · {workspace.progress.confirmedShareCount} shares confirmed.
+                  {helperSharesDelivered && !helperSharesConfirmed ? " Keep this workspace open while helper shares are tracked." : ""}
+                </p>}
+                {!workspace.round.authenticated && <p role="status">Showing saved round data. This round is not currently authenticated for voting.</p>}
                 <div className={`review-panel ${voteComplete ? "completed" : ""}`}>
                   <div className="review-stats">
                     <div><span>Selections</span><strong>{completeChoiceCount}/{workspace.round.proposals.length}</strong></div>
@@ -1218,20 +1259,13 @@ function App() {
                     <div className="result-icon"><CheckIcon /></div>
                     <div>
                       <strong>
-                        {profile === "demo"
-                          ? voteResult
-                            ? "Local rehearsal complete"
-                            : "Local rehearsal already complete"
-                          : voteResult
-                            ? "Vote confirmed"
-                            : "Vote already cast"}
+                        {voteComplete ? (profile === "demo" ? "Local rehearsal complete" : "Vote complete")
+                          : voteResult?.outcome === "blocked" ? "Voting needs attention"
+                          : votesConfirmed ? "Vote confirmed; tracking shares" : "Voting progress saved"}
                       </strong>
                       <p>
-                        {voteResult
-                          ? `${voteResult.proofCount} proof-backed vote${voteResult.proofCount === 1 ? "" : "s"} processed across ${workspace.progress.bundleCount} bundle${workspace.progress.bundleCount === 1 ? "" : "s"}.`
-                          : profile === "demo"
-                            ? `${workspace.progress.confirmedVoteCount} proof-backed vote${workspace.progress.confirmedVoteCount === 1 ? "" : "s"} completed in this local rehearsal.`
-                            : `${workspace.progress.confirmedVoteCount} proof-backed vote${workspace.progress.confirmedVoteCount === 1 ? "" : "s"} confirmed. Helper share delivery is complete.`}
+                        {voteResult?.message ?? "Saved voting progress loaded."}
+                        {` ${workspace.progress.confirmedVoteCount} votes confirmed. ${workspace.progress.submittedShareCount}/${workspace.progress.requiredShareCount} shares delivered; ${workspace.progress.confirmedShareCount} confirmed.`}
                       </p>
                       <div className="transaction-list">
                         {receiptTransactions.map((transaction) => {

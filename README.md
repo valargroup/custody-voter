@@ -13,7 +13,7 @@ When asked to build the application, produce a production-optimized release buil
 Prerequisites:
 
 - macOS with Xcode Command Line Tools
-- the current stable Rust toolchain
+- Rust 1.91 or newer (current stable recommended)
 - Node.js 20.19 or newer
 
 From the repository root:
@@ -23,7 +23,7 @@ npm install
 npm run tauri dev
 ```
 
-The app opens in **Local Demo**, which does not use the network. To exercise the whole customer journey:
+The app opens in **Testnet**. Select **Local Demo** for an offline rehearsal, then:
 
 1. Select **Generate customer target**.
 2. Select **Simulate custodian response**.
@@ -34,7 +34,19 @@ The app opens in **Local Demo**, which does not use the network. To exercise the
 
 The demo uses the production capability parser, voting database, Merkle witnesses, proof builder, hotkey signing, persisted recovery state, and confirmation parser. Delegation and vote-chain confirmations are generated locally, and nothing is broadcast.
 
-To clear the rehearsal, select **Reset local demo** in the sidebar. This removes only the Local Demo database and demo hotkey.
+**Reset all app data** removes all profiles and their hotkeys; export any recovery backups you need before using it.
+
+To build a standalone debug application with the Testnet custodian harness:
+
+```sh
+npm ci
+npm run tauri -- build --debug --bundles app
+open "src-tauri/target/debug/bundle/macos/Zcash Custody Voter.app"
+```
+
+The app uses `zcash_voting` 5.0.0 with the Zakura backend. Existing schema-13 and newer voting databases migrate in place, with a private `.before-v5` SQLite snapshot created before migration. Hotkeys and profile identifiers are preserved. Unsupported database versions are rejected without resetting them. Historical rounds that cannot be freshly authenticated remain viewable but cannot be used for new voting operations.
+
+Keep the selected workspace open until both votes and helper shares are confirmed. Reopening it resumes helper tracking; retry the vote action to reconcile an interrupted chain submission.
 
 ## Test the custody handoff with a real Testnet wallet
 
@@ -71,7 +83,7 @@ The operation is recoverable. Each scan batch is committed to the isolated walle
 7. Review the network, round, and one selection per proposal.
 8. Generate, sign, submit, and confirm the votes. If the app is interrupted, start the same action again to recover the persisted signed vote instead of producing a conflicting one.
 
-Mainnet and Testnet are separate profiles with separate databases, manifests, and Keychain namespaces. Development and debug builds default to Local Demo. Production release builds omit that selector and default to Testnet. Mainnet always has a persistent production warning.
+Mainnet and Testnet are separate profiles with separate databases, manifests, and Keychain namespaces. All builds default to Testnet. Production release builds omit the Local Demo selector. Mainnet always has a persistent production warning.
 
 ## Security model
 
@@ -82,7 +94,7 @@ Mainnet and Testnet are separate profiles with separate databases, manifests, an
 - Voting is blocked until every imported delegation has an on-chain VAN position.
 - Signed vote recovery is persisted before network submission, so an uncertain or interrupted submission can resume safely.
 - Development and debug builds include a Testnet custodian harness that recovers ZIP-32 account 0 from a supplied mnemonic and birthday into a private SQLite database, syncs only through the authenticated round snapshot, and persists signed delegation bytes before broadcast. The harness is excluded from production release builds.
-- HTTP responses are bounded while streaming. A helper share is recorded only after the configured helper redundancy target accepts it.
+- HTTP responses are bounded while streaming. The SDK journals helper delivery attempts and acknowledgements separately. Completion requires share confirmation, not just acceptance.
 - Recovery backups use passphrase-based age encryption and contain only voting state and voting hotkeys. They never contain custody funds, wallet seeds, or mnemonics.
 
 Test custodian jobs are deliberately excluded from customer recovery backups. They can contain privacy-sensitive recovered-wallet data and provider-side proof state, so use the harness only with disposable Testnet wallets and remove the app's local data when the rehearsal is no longer needed.
@@ -99,11 +111,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --lib
 ```
 
-The full proof smoke test is ignored during ordinary CI because it is CPU intensive. Run it explicitly with:
+The real-proof tests cover atomic batches, helper confirmation, database reopen, expired POST prevention, and recovery after a lost response. They are ignored during ordinary CI because they are CPU intensive. Run them explicitly with:
 
 ```sh
 cd src-tauri
-cargo test demo::tests::demo_generates_and_confirms_a_real_vote_proof -- --ignored --exact
+cargo test --locked --lib demo::tests:: -- --ignored
 ```
 
 The live Testnet wallet-recovery smoke test is also opt-in:
@@ -111,6 +123,13 @@ The live Testnet wallet-recovery smoke test is also opt-in:
 ```sh
 cd src-tauri
 cargo test test_custodian::tests::recovers_account_zero_and_scans_real_testnet_blocks -- --ignored --exact
+```
+
+Authenticated staging round discovery, helper health, and PIR snapshot readiness can be checked without broadcasting:
+
+```sh
+cd src-tauri
+cargo test --locked --lib chain::tests::staging_config_rounds_and_helpers_are_ready -- --ignored --exact
 ```
 
 ## Signed macOS releases

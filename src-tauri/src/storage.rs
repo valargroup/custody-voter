@@ -64,10 +64,77 @@ pub fn wallet_id(profile: Profile) -> String {
 }
 
 pub fn open_db(paths: &ProfilePaths, profile: Profile) -> Result<VotingDb, String> {
+    prepare_database_upgrade(&paths.database)?;
     let db = VotingDb::open_path(&paths.database)
         .map_err(|error| format!("open voting database failed: {error}"))?;
     db.set_wallet_id(&wallet_id(profile));
     Ok(db)
+}
+
+/// Snapshot supported old sidecars before the SDK can migrate them. Never
+/// let its pre-launch reset policy discard an unknown, nonempty database.
+pub(crate) fn prepare_database_upgrade(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("inspect voting database failed: {e}"))?;
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let tables: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if version > 24 {
+        return Err(format!(
+            "unsupported newer voting database schema {version}; existing data was left untouched"
+        ));
+    }
+    if version < 13 && tables > 0 {
+        return Err(format!(
+            "unsupported voting database schema {version}; existing data was left untouched"
+        ));
+    }
+    if (13..24).contains(&version) {
+        let snapshot = path.with_file_name(format!(
+            "{}.before-v5",
+            path.file_name()
+                .ok_or("database has no filename")?
+                .to_string_lossy()
+        ));
+        if !snapshot.exists() {
+            let temporary = path.with_file_name(format!("voting-migration-{}", Uuid::new_v4()));
+            let _cleanup = TemporaryDatabase(temporary.clone());
+            sqlite_snapshot(&conn, &temporary)?;
+            fs::rename(&temporary, &snapshot)
+                .map_err(|e| format!("retain pre-upgrade snapshot failed: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_snapshot(source: &rusqlite::Connection, destination: &Path) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(destination)
+        .map_err(|e| format!("create private database snapshot failed: {e}"))?;
+    let mut target = rusqlite::Connection::open(destination).map_err(|e| e.to_string())?;
+    rusqlite::backup::Backup::new(source, &mut target)
+        .map_err(|e| e.to_string())?
+        .run_to_completion(128, std::time::Duration::from_millis(10), None)
+        .map_err(|e| format!("snapshot voting database failed: {e}"))?;
+    Ok(())
 }
 
 pub fn read_manifest(paths: &ProfilePaths, profile: Profile) -> Result<ProfileManifest, String> {
@@ -282,6 +349,8 @@ pub fn round_progress(
         });
     }
     let db = open_db(paths, profile)?;
+    let snapshot = zcash_voting::recovery::round_snapshot(&db, round_id)
+        .map_err(|e| format!("load voting recovery snapshot failed: {e}"))?;
     let wallet = db.wallet_id();
     let conn = db.conn();
     let bundle_stats: Option<(i64, i64, i64)> = conn
@@ -296,17 +365,26 @@ pub fn round_progress(
         )
         .optional()
         .map_err(|error| format!("load delegation progress failed: {error}"))?;
-    let vote_stats: (i64, i64, i64) = conn
-        .query_row(
-            "SELECT COUNT(*),
-                    COALESCE(SUM(CASE WHEN tx_hash IS NOT NULL THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN vc_tree_position IS NOT NULL THEN 1 ELSE 0 END), 0)
-             FROM votes
-             WHERE round_id = :round_id AND wallet_id = :wallet_id",
-            named_params! { ":round_id": round_id, ":wallet_id": wallet },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|error| format!("load vote progress failed: {error}"))?;
+    let vote_stats = (
+        snapshot.votes.len() as i64,
+        snapshot
+            .votes
+            .iter()
+            .filter(|v| {
+                v.tx_hash.is_some()
+                    || matches!(
+                        v.phase,
+                        zcash_voting::phases::VotePhase::SubmissionManaged
+                            | zcash_voting::phases::VotePhase::SubmittedWithoutHash
+                    )
+            })
+            .count() as i64,
+        snapshot
+            .votes
+            .iter()
+            .filter(|v| v.vc_tree_position.is_some())
+            .count() as i64,
+    );
     let required_share_count = {
         let mut statement = conn
             .prepare(
@@ -334,46 +412,33 @@ pub fn round_progress(
         }
         total
     };
-    let helper_target_count = share_submission_target_count(helper_servers.len());
-    let submitted_share_count = if helper_target_count == 0 {
-        0
-    } else {
-        let mut statement = conn
-            .prepare(
-                "SELECT sent_to_urls
-                 FROM share_delegations
-                 WHERE round_id = :round_id AND wallet_id = :wallet_id",
-            )
-            .map_err(|error| format!("prepare submitted helper share query failed: {error}"))?;
-        let rows = statement
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet },
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("query submitted helper shares failed: {error}"))?;
-        let mut complete = 0u32;
-        for row in rows {
-            let sent_to_urls =
-                row.map_err(|error| format!("decode helper share delivery failed: {error}"))?;
-            let sent_to_urls: Vec<String> = serde_json::from_str(&sent_to_urls)
-                .map_err(|error| format!("decode helper share server list failed: {error}"))?;
-            let accepted_count = sent_to_urls
-                .into_iter()
-                .filter(|url| {
-                    helper_servers
-                        .iter()
-                        .any(|server| server.url.as_str() == url.as_str())
-                })
+    let configured_helpers = zcash_voting::helper::url::canonical_helper_url_list(
+        &helper_servers
+            .iter()
+            .map(|s| s.url.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|e| e.to_string())?;
+    let shares = zcash_voting::storage::queries::get_share_delegations(&conn, round_id, &wallet)
+        .map_err(|e| format!("load SDK share progress failed: {e}"))?;
+    let submitted_share_count = shares
+        .iter()
+        .filter(|share| {
+            let target = if share.target_count == 0 {
+                share_submission_target_count(configured_helpers.len())
+            } else {
+                share.target_count as usize
+            };
+            let accepted = share
+                .sent_to_urls
+                .iter()
+                .filter(|url| configured_helpers.contains(url))
                 .collect::<BTreeSet<_>>()
                 .len();
-            if accepted_count >= helper_target_count {
-                complete = complete.checked_add(1).ok_or_else(|| {
-                    "submitted helper share count is outside the supported range".to_string()
-                })?;
-            }
-        }
-        complete
-    };
+            share.confirmed || (target > 0 && accepted >= target)
+        })
+        .count() as u32;
+    let confirmed_share_count = shares.iter().filter(|share| share.confirmed).count() as u32;
     let (bundle_count, confirmed_bundle_count, delegated_value) = bundle_stats.unwrap_or_default();
     Ok(RoundProgress {
         target_ready,
@@ -386,6 +451,7 @@ pub fn round_progress(
         confirmed_vote_count: to_u32(vote_stats.2, "confirmed vote count")?,
         required_share_count,
         submitted_share_count,
+        confirmed_share_count,
     })
 }
 
@@ -396,7 +462,16 @@ fn encrypted_share_count(commitment_json: &str) -> Result<u32, String> {
         .get("encrypted_shares")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "stored vote commitment has no encrypted share list".to_string())?;
-    u32::try_from(shares.len())
+    let count = if commitment
+        .get("single_share")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        shares.len().min(1)
+    } else {
+        shares.len()
+    };
+    u32::try_from(count)
         .map_err(|_| "required helper share count is outside the supported range".to_string())
 }
 
@@ -409,44 +484,19 @@ pub fn vote_records(
         return Ok(Vec::new());
     }
     let db = open_db(paths, profile)?;
-    let wallet = db.wallet_id();
-    let conn = db.conn();
-    let mut statement = conn
-        .prepare(
-            "SELECT bundle_index, proposal_id, choice, tx_hash, vc_tree_position
-             FROM votes
-             WHERE round_id = :round_id AND wallet_id = :wallet_id
-             ORDER BY bundle_index, proposal_id",
-        )
-        .map_err(|error| format!("prepare vote recovery query failed: {error}"))?;
-    let rows = statement
-        .query_map(
-            named_params! { ":round_id": round_id, ":wallet_id": wallet },
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            },
-        )
-        .map_err(|error| format!("query vote recovery state failed: {error}"))?;
-    rows.map(|row| {
-        let (bundle, proposal, choice, tx_hash, vc_position) =
-            row.map_err(|error| format!("decode vote recovery row failed: {error}"))?;
-        Ok(VoteRecordView {
-            bundle_index: to_u32(bundle, "bundle index")?,
-            proposal_id: to_u32(proposal, "proposal id")?,
-            choice: to_u32(choice, "vote choice")?,
-            tx_hash,
-            vc_tree_position: vc_position
-                .map(|value| to_u64(value, "vote commitment tree position"))
-                .transpose()?,
+    let snapshot = zcash_voting::recovery::round_snapshot(&db, round_id)
+        .map_err(|e| format!("load vote recovery snapshot failed: {e}"))?;
+    Ok(snapshot
+        .votes
+        .into_iter()
+        .map(|vote| VoteRecordView {
+            bundle_index: vote.bundle_index,
+            proposal_id: vote.proposal_id,
+            choice: vote.choice,
+            tx_hash: vote.tx_hash,
+            vc_tree_position: vote.vc_tree_position,
         })
-    })
-    .collect()
+        .collect())
 }
 
 pub fn export_backup(
@@ -459,12 +509,13 @@ pub fn export_backup(
     let manifest = read_manifest(paths, profile)?;
 
     let db = open_db(paths, profile)?;
-    db.conn()
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .map_err(|error| format!("checkpoint voting database failed: {error}"))?;
-    drop(db);
-    let database = fs::read(&paths.database)
-        .map_err(|error| format!("read voting database for backup failed: {error}"))?;
+    let snapshot = paths
+        .directory
+        .join(format!("voting.sqlite.export-{}", Uuid::new_v4()));
+    let _cleanup = TemporaryDatabase(snapshot.clone());
+    sqlite_snapshot(&db.conn(), &snapshot)?;
+    let database = fs::read(&snapshot)
+        .map_err(|error| format!("read voting database snapshot failed: {error}"))?;
     validate_backup_database_size(database.len())?;
 
     let mut hotkeys = Vec::with_capacity(manifest.rounds.len());
@@ -528,6 +579,7 @@ pub fn restore_backup(
     fs::write(&temp_database, &*database)
         .map_err(|error| format!("write restored database candidate failed: {error}"))?;
     {
+        prepare_database_upgrade(&temp_database)?;
         let db = VotingDb::open_path(&temp_database)
             .map_err(|error| format!("restored voting database is invalid: {error}"))?;
         db.set_wallet_id(&wallet_id(profile));
@@ -963,6 +1015,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn last_moment_progress_requires_only_the_delivered_single_share() {
+        assert_eq!(
+            encrypted_share_count(r#"{"single_share":true,"encrypted_shares":[{},{},{}]}"#)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            encrypted_share_count(r#"{"single_share":false,"encrypted_shares":[{},{},{}]}"#)
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn v3_sidecar_and_encrypted_backup_migrate_without_losing_voting_state() {
+        let root = std::env::temp_dir().join(format!("custody-v5-migration-{}", Uuid::new_v4()));
+        let paths = profile_paths(&root, Profile::Testnet).unwrap();
+        let conn = rusqlite::Connection::open(&paths.database).unwrap();
+        conn.execute_batch(include_str!("../tests/fixtures/v3_completed_round.sql"))
+            .unwrap();
+        type DurableBundle = (u32, Vec<u8>, Vec<u8>, Option<String>);
+        fn durable_rows(conn: &rusqlite::Connection) -> Vec<DurableBundle> {
+            let mut statement=conn.prepare("SELECT bundle_index,van_comm_rand,gov_comm,delegation_tx_hash FROM bundles ORDER BY bundle_index").unwrap();
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        }
+        let before = durable_rows(&conn);
+        drop(conn);
+        let old_bytes = fs::read(&paths.database).unwrap();
+        let encrypted = encrypt_age("migration-test-passphrase", &old_bytes).unwrap();
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        assert_eq!(durable_rows(&db.conn()), before);
+        assert_eq!(
+            db.conn()
+                .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            24
+        );
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT count(*) FROM votes", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        assert!(paths.directory.join("voting.sqlite.before-v5").exists());
+        let snapshot = rusqlite::Connection::open_with_flags(
+            paths.directory.join("voting.sqlite.before-v5"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            13
+        );
+        assert_eq!(durable_rows(&snapshot), before);
+        drop(snapshot);
+        drop(db);
+        let restored = paths.directory.join("restored.sqlite");
+        fs::write(
+            &restored,
+            decrypt_age("migration-test-passphrase", &encrypted)
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        prepare_database_upgrade(&restored).unwrap();
+        let restored_db = VotingDb::open_path(&restored).unwrap();
+        assert_eq!(durable_rows(&restored_db.conn()), before);
+        drop(restored_db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unknown_sidecar_schemas_are_rejected_without_mutation() {
+        for version in [12, 25] {
+            let root = std::env::temp_dir().join(format!("custody-schema-{}", Uuid::new_v4()));
+            let paths = profile_paths(&root, Profile::Testnet).unwrap();
+            let conn = rusqlite::Connection::open(&paths.database).unwrap();
+            conn.execute_batch("CREATE TABLE important_state (value TEXT); INSERT INTO important_state VALUES ('preserve me');").unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            let before = fs::read(&paths.database).unwrap();
+            assert!(open_db(&paths, Profile::Testnet).is_err());
+            assert_eq!(fs::read(&paths.database).unwrap(), before);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn atomic_write_replaces_an_existing_file() {
         let directory =
             std::env::temp_dir().join(format!("custody-voter-atomic-write-{}", Uuid::new_v4()));
@@ -1080,27 +1226,34 @@ mod tests {
                 .unwrap();
         }
         for (proposal_id, share_index, sent_to_urls) in [
-            (1, 0, r#"["helper-a","helper-b"]"#),
-            (1, 1, r#"["helper-a"]"#),
-            (2, 0, r#"["helper-a","helper-b"]"#),
-            (2, 1, r#"["helper-a","helper-b","helper-b"]"#),
+            (1, 0, r#"["https://helper-a","https://helper-b"]"#),
+            (1, 1, r#"["https://helper-a"]"#),
+            (2, 0, r#"["https://helper-a","https://helper-b"]"#),
+            (
+                2,
+                1,
+                r#"["https://helper-a","https://helper-b","https://helper-b"]"#,
+            ),
         ] {
             db.conn()
                 .execute(
                     "INSERT INTO share_delegations (
                         round_id, wallet_id, bundle_index, proposal_id, share_index,
                         sent_to_urls, nullifier, confirmed, submit_at, created_at
-                     ) VALUES ('round', ?1, 0, ?2, ?3, ?4, X'00', 1, 1, 1)",
+                     ) VALUES ('round', ?1, 0, ?2, ?3, ?4, X'00', 0, 1, 1)",
                     rusqlite::params![wallet, proposal_id, share_index, sent_to_urls],
                 )
                 .unwrap();
         }
         drop(db);
 
-        let helper_servers = ["helper-a", "helper-b", "helper-c"].map(|url| ServiceEndpointView {
-            url: url.to_string(),
-            label: url.to_string(),
-        });
+        let helper_servers =
+            ["https://helper-a", "https://helper-b", "https://helper-c"].map(|url| {
+                ServiceEndpointView {
+                    url: url.to_string(),
+                    label: url.to_string(),
+                }
+            });
         let interrupted = round_progress(
             &paths,
             Profile::Testnet,
@@ -1126,6 +1279,26 @@ mod tests {
         assert_eq!(progress.confirmed_vote_count, 2);
         assert_eq!(progress.required_share_count, 5);
         assert_eq!(progress.submitted_share_count, 3);
+        assert_eq!(progress.confirmed_share_count, 0);
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE share_delegations SET confirmed=1 WHERE proposal_id=1",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let confirmed = round_progress(
+            &paths,
+            Profile::Testnet,
+            "round",
+            true,
+            true,
+            &helper_servers,
+        )
+        .unwrap();
+        assert_eq!(confirmed.submitted_share_count, 4);
+        assert_eq!(confirmed.confirmed_share_count, 2);
     }
 
     #[test]

@@ -32,7 +32,7 @@ jobs:
           workspaces: src-tauri
       - run: cargo fmt --all -- --check
         working-directory: src-tauri
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
         working-directory: src-tauri
-      - run: cargo test --lib
+      - run: cargo test --locked --lib
         working-directory: src-tauri

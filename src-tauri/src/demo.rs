@@ -1,21 +1,28 @@
+//! Offline chain and helper transports. Every state transition still passes
+//! through the same SDK lifecycle as a live vote; these transports never use a socket.
+use crate::{
+    model::{AppOption, AppProposal, Profile, RoundSnapshot, ServiceEndpointView},
+    voter,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ff::PrimeField;
 use group::{Group, GroupEncoding};
-use pasta_curves::{pallas, Fp};
-use rusqlite::named_params;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use vote_commitment_tree::MemoryTreeServer;
-use zcash_voting::{
-    confirmation::{
-        confirm_delegation_submission, confirm_vote_submission, TxEvent, TxEventAttribute,
-    },
-    delegation_capability::{DelegationCapabilityBundleV1, DelegationCapabilityV1},
-    round::VotingDb,
-    vote::{recover_signed_commitments, SignedVoteCommitment, VanWitness},
-    VotingHotkey,
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
-
-use crate::model::{AppOption, AppProposal, Profile, RoundSnapshot};
+use vote_commitment_tree::{sync_api::TreeSyncApi, MemoryTreeServer};
+use vote_commitment_tree_client::transport::{Transport, TransportError, TransportResponse};
+use zcash_voting::backend::pasta_curves::{pallas, Fp};
+use zcash_voting::{
+    delegation_capability::{DelegationCapabilityBundleV1, DelegationCapabilityV1},
+    helper::transport::{HelperFuture, HelperResponse, HelperTransport},
+    prelude::*,
+    vote::{recovery_bundle, VoteRecoveryBundle},
+};
 
 pub fn round_snapshot() -> RoundSnapshot {
     let round_id = hex::encode(Fp::from(4_242u64).to_repr());
@@ -59,7 +66,7 @@ pub fn round_snapshot() -> RoundSnapshot {
             nc_root: Fp::from(7u64).to_repr().to_vec(),
             nullifier_imt_root: Fp::from(8u64).to_repr().to_vec(),
         },
-        vote_servers: Vec::new(),
+        vote_servers: vec![ServiceEndpointView {url:"http://custody-demo.invalid".into(),label:"Local simulation".into()}],
         authenticated: true,
     }
 }
@@ -97,317 +104,737 @@ pub fn capability_json(hotkey: &VotingHotkey) -> Result<String, String> {
     .map_err(|error| format!("demo capability is not UTF-8: {error}"))
 }
 
-pub fn confirm_delegations(db: &VotingDb, round_id: &str) -> Result<(), String> {
-    let wallet = db.wallet_id();
-    let rows = {
-        let conn = db.conn();
-        let mut statement = conn
-            .prepare(
-                "SELECT bundle_index, delegation_tx_hash
-                 FROM bundles
-                 WHERE round_id = :round_id AND wallet_id = :wallet_id
-                 ORDER BY bundle_index",
-            )
-            .map_err(|error| format!("prepare demo delegation query failed: {error}"))?;
-        let mapped = statement
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet },
-                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
-            )
-            .map_err(|error| format!("query demo delegations failed: {error}"))?;
-        mapped
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("decode demo delegation failed: {error}"))?
-    };
-    if rows.is_empty() {
-        return Err("import the demo custody payload before confirming it".to_string());
-    }
-    for (bundle_index, tx_hash) in rows {
-        let events = vec![event("delegate_vote", round_id, bundle_index.to_string())];
-        confirm_delegation_submission(db, round_id, bundle_index, &tx_hash, &events)
-            .map_err(|error| format!("confirm demo delegation failed: {error}"))?;
-    }
+pub struct DemoTransport {
+    db: Arc<VotingDb>,
+    round_id: String,
+    state: Mutex<DemoChain>,
+}
+struct DemoChain {
+    tree: MemoryTreeServer,
+    transactions: HashMap<String, Value>,
+    bodies: HashMap<Vec<u8>, Value>,
+    height: u32,
+}
+
+fn event(kind: &str, round: &str, mut attributes: Vec<(&str, String)>) -> Value {
+    attributes.push(("vote_round_id", round.into()));
+    json!({"type":kind,"attributes":attributes.into_iter().map(|(key,value)|json!({"key":key,"value":value})).collect::<Vec<_>>()})
+}
+fn confirmed(height: u32, event: Value) -> Value {
+    json!({"height":height.to_string(),"code":0,"log":"","events":[event]})
+}
+fn field(bytes: &[u8]) -> Result<Fp, String> {
+    let repr: [u8; 32] = bytes.try_into().map_err(|_| "invalid demo field length")?;
+    Option::from(Fp::from_repr(repr)).ok_or_else(|| "invalid demo field".into())
+}
+fn append(tree: &mut MemoryTreeServer, bytes: &[u8]) -> Result<(), String> {
+    tree.append(field(bytes)?)
+        .map_err(|e| format!("append demo leaf: {e:?}"))?;
     Ok(())
 }
 
-pub fn witness(db: &VotingDb, round_id: &str, bundle_index: u32) -> Result<VanWitness, String> {
-    let (tree, current_positions) = rebuild_tree(db, round_id)?;
-    let position = current_positions
-        .iter()
-        .find(|(index, _)| *index == bundle_index)
-        .map(|(_, position)| *position)
-        .ok_or_else(|| format!("demo bundle {bundle_index} has no confirmed VAN position"))?;
-    let anchor_height = 1;
-    let path = tree
-        .path(u64::from(position), anchor_height)
-        .ok_or_else(|| format!("build demo witness for position {position} failed"))?;
-    Ok(VanWitness::from((path, anchor_height)))
-}
-
-pub fn confirm_vote(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    commitment: &SignedVoteCommitment,
-) -> Result<(String, u64), String> {
-    let (tree, _) = rebuild_tree(db, round_id)?;
-    let van_position = tree.size();
-    let vc_position = van_position + 1;
-    let tx_hash = hex::encode(Sha256::digest(
-        [
-            commitment.vote_authority_note_new.as_slice(),
-            commitment.vote_commitment.as_slice(),
-        ]
-        .concat(),
-    ));
-    let events = vec![event(
-        "cast_vote",
-        round_id,
-        format!("{van_position},{vc_position}"),
-    )];
-    confirm_vote_submission(
-        db,
-        round_id,
-        bundle_index,
-        commitment.proposal_id,
-        &tx_hash,
-        &events,
-    )
-    .map_err(|error| format!("confirm demo vote failed: {error}"))?;
-    Ok((tx_hash, vc_position))
-}
-
-fn rebuild_tree(
-    db: &VotingDb,
-    round_id: &str,
-) -> Result<(MemoryTreeServer, Vec<(u32, u32)>), String> {
-    let wallet = db.wallet_id();
-    let (initial_vans, mut current_positions, vote_keys) = {
-        let conn = db.conn();
-        let mut bundle_statement = conn
-            .prepare(
-                "SELECT bundle_index, gov_comm, van_leaf_position
-                 FROM bundles
-                 WHERE round_id = :round_id AND wallet_id = :wallet_id
-                 ORDER BY bundle_index",
-            )
-            .map_err(|error| format!("prepare demo tree bundle query failed: {error}"))?;
-        let bundles = bundle_statement
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet },
-                |row| {
+impl DemoTransport {
+    pub fn new(db: Arc<VotingDb>, round: &RoundSnapshot) -> Result<Arc<Self>, String> {
+        let mut state = DemoChain {
+            tree: MemoryTreeServer::empty(),
+            transactions: HashMap::new(),
+            bodies: HashMap::new(),
+            height: 1,
+        };
+        let rows = {
+            let conn = db.conn();
+            let mut stmt = conn.prepare("SELECT bundle_index, gov_comm, delegation_tx_hash FROM bundles WHERE wallet_id=?1 AND round_id=?2 ORDER BY bundle_index").map_err(|e|e.to_string())?;
+            let result = stmt
+                .query_map(rusqlite::params![db.wallet_id(), round.round_id], |r| {
                     Ok((
-                        row.get::<_, u32>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Option<u32>>(2)?,
+                        r.get::<_, u32>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, String>(2)?,
                     ))
-                },
-            )
-            .map_err(|error| format!("query demo tree bundles failed: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("decode demo tree bundle failed: {error}"))?;
-
-        let mut vote_statement = conn
-            .prepare(
-                "SELECT bundle_index, proposal_id, vc_tree_position
-                 FROM votes
-                 WHERE round_id = :round_id AND wallet_id = :wallet_id
-                   AND vc_tree_position IS NOT NULL
-                 ORDER BY vc_tree_position",
-            )
-            .map_err(|error| format!("prepare demo tree vote query failed: {error}"))?;
-        let votes = vote_statement
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet },
-                |row| {
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            result
+        };
+        for (_, commitment, hash) in rows {
+            let position = state.tree.size();
+            append(&mut state.tree, &commitment)?;
+            state.transactions.insert(
+                hash,
+                confirmed(
+                    1,
+                    event(
+                        "delegate_vote",
+                        &round.round_id,
+                        vec![("leaf_index", position.to_string())],
+                    ),
+                ),
+            );
+        }
+        state
+            .tree
+            .checkpoint(1)
+            .map_err(|e| format!("demo checkpoint: {e:?}"))?;
+        // Recreate the local ledger from confirmed public commitments after an
+        // app restart or backup restore, preserving historical singleton layouts.
+        let keys = {
+            let conn = db.conn();
+            let mut stmt=conn.prepare("SELECT bundle_index,proposal_id,tx_hash,vc_tree_position FROM votes WHERE wallet_id=?1 AND round_id=?2 AND vc_tree_position IS NOT NULL ORDER BY vc_tree_position").map_err(|e|e.to_string())?;
+            let result = stmt
+                .query_map(rusqlite::params![db.wallet_id(), round.round_id], |r| {
                     Ok((
-                        row.get::<_, u32>(0)?,
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, u64>(2)?,
+                        r.get::<_, u32>(0)?,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, u64>(3)?,
                     ))
-                },
-            )
-            .map_err(|error| format!("query demo tree votes failed: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("decode demo tree vote failed: {error}"))?;
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            result
+        };
+        let mut batches = HashSet::new();
+        for (bundle, proposal, hash, position) in keys {
+            let recovery = recovery_bundle(&db, &round.round_id, bundle, proposal)
+                .map_err(|e| e.to_string())?
+                .ok_or("missing demo recovery")?;
+            let recoveries = if let Some(batch) = &recovery.batch {
+                if !batches.insert(batch.digest) {
+                    continue;
+                }
+                let signed = zcash_voting::vote::recover_atomic_vote_batch(
+                    &db,
+                    &round.round_id,
+                    bundle,
+                    proposal,
+                )
+                .map_err(|e| e.to_string())?;
+                signed
+                    .commitments
+                    .iter()
+                    .map(|c| {
+                        recovery_bundle(&db, &round.round_id, bundle, c.proposal_id)
+                            .map_err(|e| e.to_string())?
+                            .ok_or("missing batch recovery".into())
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            } else {
+                vec![recovery]
+            };
+            if state.tree.size() + 1 != position {
+                return Err("saved demo tree positions are inconsistent".into());
+            }
+            let receipt = state.apply_votes(&round.round_id, &recoveries)?;
+            if let Some(hash) = hash {
+                state.transactions.insert(hash, receipt);
+            }
+        }
+        Ok(Arc::new(Self {
+            db,
+            round_id: round.round_id.clone(),
+            state: Mutex::new(state),
+        }))
+    }
 
-        let initial_vans = bundles
-            .iter()
-            .map(|(index, bytes, _)| Ok((*index, decode_field(bytes, "demo VAN commitment")?)))
-            .collect::<Result<Vec<_>, String>>()?;
-        let positions = bundles
-            .iter()
-            .map(|(index, _, position)| {
-                position
-                    .map(|position| (*index, position))
-                    .ok_or_else(|| format!("demo bundle {index} is not confirmed"))
+    fn read(&self, url: &str) -> Result<(u16, Value), String> {
+        let state = self.state.lock().map_err(|_| "demo chain lock poisoned")?;
+        if url.contains("/tx/") {
+            return Ok(
+                match state
+                    .transactions
+                    .get(url.rsplit('/').next().unwrap_or_default())
+                {
+                    Some(v) => (200, v.clone()),
+                    None => (404, json!({"error":"tx not found"})),
+                },
+            );
+        }
+        if url.contains("/commitment-tree/") {
+            if let Some(query) = url.split('?').nth(1) {
+                let pairs = query
+                    .split('&')
+                    .filter_map(|v| v.split_once('='))
+                    .collect::<HashMap<_, _>>();
+                let from = pairs
+                    .get("from_height")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let to = pairs
+                    .get("to_height")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(state.height);
+                let page = state
+                    .tree
+                    .get_block_commitments(from, to)
+                    .map_err(|e| e.to_string())?;
+                return Ok((
+                    200,
+                    json!({"blocks":page.blocks.iter().map(|b|json!({"height":b.height,"start_index":b.start_index,"leaves":b.leaves.iter().map(|l|BASE64_STANDARD.encode(l.to_bytes())).collect::<Vec<_>>(),"root":BASE64_STANDARD.encode(b.root.to_repr())})).collect::<Vec<_>>(),"next_from_height":0}),
+                ));
+            }
+            let height = url
+                .rsplit('/')
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(state.height);
+            return Ok((
+                200,
+                json!({"tree":{"height":height,"next_index":state.tree.size(),"root":BASE64_STANDARD.encode(state.tree.root_at_height(height).unwrap_or_else(||state.tree.root()).to_repr())}}),
+            ));
+        }
+        Err("unexpected offline chain route".into())
+    }
+
+    fn post(&self, body: Vec<u8>) -> Result<Value, String> {
+        if let Some(response) = self
+            .state
+            .lock()
+            .map_err(|_| "demo lock poisoned")?
+            .bodies
+            .get(&body)
+        {
+            return Ok(response.clone());
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+        let votes = value
+            .get("votes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![value.clone()]);
+        let first = votes.first().ok_or("empty demo vote batch")?;
+        let proposal = first["proposal_id"]
+            .as_u64()
+            .ok_or("demo vote has no proposal")? as u32;
+        let nf = BASE64_STANDARD
+            .decode(
+                first["van_nullifier"]
+                    .as_str()
+                    .ok_or("demo vote has no nullifier")?,
+            )
+            .map_err(|e| e.to_string())?;
+        let count = self
+            .db
+            .get_bundle_count(&self.round_id)
+            .map_err(|e| e.to_string())?;
+        let mut selected = None;
+        for bundle in 0..count {
+            if let Some(r) = recovery_bundle(&self.db, &self.round_id, bundle, proposal)
+                .map_err(|e| e.to_string())?
+            {
+                if r.van_nullifier.as_slice() == nf {
+                    selected = Some(bundle);
+                    break;
+                }
+            }
+        }
+        let bundle = selected.ok_or("demo request does not match persisted recovery")?;
+        let mut recoveries = Vec::new();
+        for vote in votes {
+            let proposal = vote["proposal_id"]
+                .as_u64()
+                .ok_or("invalid demo proposal")? as u32;
+            recoveries.push(
+                recovery_bundle(&self.db, &self.round_id, bundle, proposal)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("missing demo vote recovery")?,
+            );
+        }
+        let hash = hex::encode(Sha256::digest(&body));
+        let mut state = self.state.lock().map_err(|_| "demo lock poisoned")?;
+        let receipt = state.apply_votes(&self.round_id, &recoveries)?;
+        state.transactions.insert(hash.clone(), receipt);
+        let mut response = json!({"tx_hash":hash,"code":0});
+        if let Some(batch) = recoveries.last().and_then(|r| r.batch.as_ref()) {
+            response["batch_digest"] = json!(hex::encode(batch.digest));
+        }
+        state.bodies.insert(body, response.clone());
+        Ok(response)
+    }
+}
+impl DemoChain {
+    fn apply_votes(&mut self, round: &str, votes: &[VoteRecoveryBundle]) -> Result<Value, String> {
+        let last = votes.last().ok_or("empty demo batch")?;
+        let van_position = self.tree.size();
+        append(&mut self.tree, &last.vote_authority_note_new)?;
+        for vote in votes {
+            append(&mut self.tree, &vote.vote_commitment)?;
+        }
+        self.height += 1;
+        self.tree
+            .checkpoint(self.height)
+            .map_err(|e| format!("demo checkpoint: {e:?}"))?;
+        let event = if let Some(batch) = &last.batch {
+            event(
+                "cast_vote_batch",
+                round,
+                vec![
+                    ("batch_digest", hex::encode(batch.digest)),
+                    ("batch_size", votes.len().to_string()),
+                    ("final_van_leaf_index", van_position.to_string()),
+                    (
+                        "vote_commitment_leaf_indices",
+                        (1..=votes.len())
+                            .map(|i| (van_position + i as u64).to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                    (
+                        "proposal_ids",
+                        votes
+                            .iter()
+                            .map(|v| v.proposal_id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                    (
+                        "van_nullifiers",
+                        votes
+                            .iter()
+                            .map(|v| hex::encode(v.van_nullifier))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                ],
+            )
+        } else {
+            event(
+                "cast_vote",
+                round,
+                vec![(
+                    "leaf_index",
+                    format!("{},{}", van_position, van_position + 1),
+                )],
+            )
+        };
+        Ok(confirmed(self.height, event))
+    }
+}
+impl ChainTransport for DemoTransport {
+    fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
+        Box::pin(async move {
+            self.read(request.url())
+                .map(|(status, v)| ChainHttpResponse::json(status, v.to_string().into_bytes()))
+                .map_err(ChainTransportError::definitely_unsent)
+        })
+    }
+    fn chain_post_json<'a>(
+        &'a self,
+        _request: ChainHttpRequest,
+        body: Vec<u8>,
+    ) -> ChainTransportFuture<'a> {
+        Box::pin(async move {
+            self.post(body)
+                .map(|v| ChainHttpResponse::json(200, v.to_string().into_bytes()))
+                .map_err(ChainTransportError::possibly_dispatched)
+        })
+    }
+}
+impl Transport for DemoTransport {
+    fn get(&self, url: &str) -> Result<TransportResponse, TransportError> {
+        self.read(url)
+            .map(|(status, v)| TransportResponse {
+                status,
+                body: v.to_string().into_bytes(),
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        (initial_vans, positions, votes)
-    };
-
-    let mut tree = MemoryTreeServer::empty();
-    for (expected, (bundle_index, van)) in initial_vans.into_iter().enumerate() {
-        if bundle_index != expected as u32 {
-            return Err("demo bundle indices are not contiguous".to_string());
-        }
-        tree.append(van)
-            .map_err(|error| format!("append demo delegation VAN failed: {error:?}"))?;
+            .map_err(TransportError::Request)
     }
-    for (bundle_index, proposal_id, expected_vc_position) in vote_keys {
-        let signed = recover_signed_commitments(db, round_id, bundle_index, proposal_id)
-            .map_err(|error| format!("recover demo vote commitment failed: {error}"))?;
-        let commitment = signed
-            .commitments
-            .first()
-            .ok_or_else(|| "recovered demo vote has no commitment".to_string())?;
-        let expected_van_position = expected_vc_position
-            .checked_sub(1)
-            .ok_or_else(|| "demo vote has invalid VC tree position".to_string())?;
-        if tree.size() != expected_van_position {
-            return Err("demo vote tree positions are not contiguous".to_string());
-        }
-        tree.append_two(
-            decode_field(&commitment.vote_authority_note_new, "new demo VAN")?,
-            decode_field(&commitment.vote_commitment, "demo vote commitment")?,
-        )
-        .map_err(|error| format!("append demo vote leaves failed: {error:?}"))?;
-        let current_position = current_positions
-            .iter_mut()
-            .find(|(index, _)| *index == bundle_index)
-            .ok_or_else(|| format!("demo vote references unknown bundle {bundle_index}"))?;
-        current_position.1 = u32::try_from(expected_van_position)
-            .map_err(|_| "demo VAN position exceeds u32".to_string())?;
-    }
-    tree.checkpoint(1)
-        .map_err(|error| format!("checkpoint demo vote tree failed: {error:?}"))?;
-    Ok((tree, current_positions))
 }
-
-fn decode_field(bytes: &[u8], field: &str) -> Result<Fp, String> {
-    let repr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| format!("{field} must contain 32 bytes"))?;
-    Option::<Fp>::from(Fp::from_repr(repr))
-        .ok_or_else(|| format!("{field} is not a canonical Pallas field element"))
-}
-
-fn event(event_type: &str, round_id: &str, leaf_index: String) -> TxEvent {
-    TxEvent {
-        event_type: event_type.to_string(),
-        attributes: vec![
-            TxEventAttribute {
-                key: "vote_round_id".to_string(),
-                value: round_id.to_string(),
-            },
-            TxEventAttribute {
-                key: "leaf_index".to_string(),
-                value: leaf_index,
-            },
-        ],
+pub struct DemoHelper;
+impl HelperTransport for DemoHelper {
+    fn get<'a>(&'a self, url: &'a str, _timeout: Duration) -> HelperFuture<'a> {
+        Box::pin(async move {
+            Ok(HelperResponse::json(
+                200,
+                json!({"status":if url.ends_with("/status") {"ok"} else {"confirmed"}})
+                    .to_string()
+                    .into_bytes(),
+            ))
+        })
     }
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: Vec<u8>,
+        _timeout: Duration,
+    ) -> HelperFuture<'a> {
+        Box::pin(async {
+            Ok(HelperResponse::json(
+                200,
+                br#"{"status":"queued"}"#.to_vec(),
+            ))
+        })
+    }
+}
+pub fn executor(
+    db: Arc<VotingDb>,
+    round: &RoundSnapshot,
+    hotkey: &VotingHotkey,
+) -> Result<(RoundExecutor<Arc<DemoTransport>>, Arc<DemoTransport>), String> {
+    let transport = DemoTransport::new(Arc::clone(&db), round)?;
+    let helpers = HelperClient::new(Arc::new(DemoHelper), HelperHealth::default());
+    RoundExecutor::with_transport(
+        db,
+        Arc::clone(&transport),
+        voter::chain_config(round),
+        helpers,
+    )
+    .map_err(|e| e.to_string())?
+    .with_binding(voter::round_binding(round, hotkey))
+    .map(|e| (e.with_tree_transport(transport.clone()), transport))
+    .map_err(|e| e.to_string())
+}
+pub async fn confirm_delegations(db: Arc<VotingDb>, round: &RoundSnapshot) -> Result<(), String> {
+    let transport = DemoTransport::new(Arc::clone(&db), round)?;
+    let client = ChainSubmissionClient::with_transport(
+        Arc::clone(&db),
+        transport,
+        voter::chain_config(round),
+    )
+    .map_err(|e| e.to_string())?;
+    for bundle_index in 0..db
+        .get_bundle_count(&round.round_id)
+        .map_err(|e| e.to_string())?
+    {
+        let result = client
+            .advance_imported_delegation(
+                AdvanceImportedDelegation {
+                    vote_round_id: voter::round_bytes(round)?,
+                    bundle_index,
+                },
+                &ChainSubmissionControl::new(0),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if !matches!(result, ChainSubmissionResult::Confirmed(_)) {
+            return Err(format!("demo delegation not confirmed: {result:?}"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcash_voting::{
-        delegation_capability::{import_delegation_capability, ImportDelegationCapabilityParams},
-        hotkey::generate_random_voting_hotkey,
-        vote::{commit_batch, DraftVote, VoteSigner},
-        NoopProgressReporter,
+    use crate::model::VoteChoiceInput;
+    use zcash_voting::delegation_capability::{
+        import_delegation_capability, ImportDelegationCapabilityParams,
     };
 
-    #[test]
-    fn demo_capability_uses_real_atomic_import_and_confirmation() {
-        let round = round_snapshot();
-        let hotkey = generate_random_voting_hotkey(Profile::Demo.network()).unwrap();
-        let capability = capability_json(&hotkey).unwrap();
-        let db = VotingDb::open_in_memory().unwrap();
-        db.set_wallet_id("demo-test");
-        let digest = import_delegation_capability(
-            &db,
-            capability.as_bytes(),
-            ImportDelegationCapabilityParams {
-                voting_hotkey: &hotkey,
-                expected_chain_id: &round.chain_id,
-                expected_network: Profile::Demo.network(),
-                expected_round_params: &round.params,
-                session_json: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(digest.to_hex().len(), 64);
-        assert_eq!(db.get_bundle_count(&round.round_id).unwrap(), 2);
-        confirm_delegations(&db, &round.round_id).unwrap();
-        let witness = witness(&db, &round.round_id, 1).unwrap();
-        assert_eq!(witness.position, 1);
-        assert_eq!(witness.auth_path.len(), 24);
-    }
-
-    #[test]
-    #[ignore = "generates a full zero-knowledge vote proof"]
-    fn demo_generates_and_confirms_sequential_vote_proofs() {
-        let round = round_snapshot();
-        let hotkey = generate_random_voting_hotkey(Profile::Demo.network()).unwrap();
-        let capability = capability_json(&hotkey).unwrap();
-        let db = VotingDb::open_in_memory().unwrap();
-        db.set_wallet_id("demo-proof-test");
+    fn import(db: &VotingDb, round: &RoundSnapshot, hotkey: &VotingHotkey) {
         import_delegation_capability(
-            &db,
-            capability.as_bytes(),
+            db,
+            capability_json(hotkey).unwrap().as_bytes(),
             ImportDelegationCapabilityParams {
-                voting_hotkey: &hotkey,
+                voting_hotkey: hotkey,
                 expected_chain_id: &round.chain_id,
-                expected_network: Profile::Demo.network(),
+                expected_network: round.profile.network(),
                 expected_round_params: &round.params,
                 session_json: None,
             },
         )
         .unwrap();
-        confirm_delegations(&db, &round.round_id).unwrap();
-        let initial_witness = witness(&db, &round.round_id, 0).unwrap();
-        let signed = commit_batch(
+    }
+    #[tokio::test]
+    async fn imported_delegation_confirms_without_signing_or_broadcasting() {
+        let round = round_snapshot();
+        let db = Arc::new(VotingDb::open_in_memory().unwrap());
+        db.set_wallet_id("demo-test");
+        let hotkey = generate_random_voting_hotkey(Profile::Demo.network()).unwrap();
+        import(&db, &round, &hotkey);
+        confirm_delegations(Arc::clone(&db), &round).await.unwrap();
+        let confirmed: u32 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM bundles WHERE van_leaf_position IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(confirmed, 2);
+        confirm_delegations(Arc::clone(&db), &round).await.unwrap();
+        let transport = DemoTransport::new(Arc::clone(&db), &round).unwrap();
+        assert!(transport.state.lock().unwrap().bodies.is_empty());
+    }
+    #[test]
+    fn capability_rejects_wrong_hotkey_and_round() {
+        let round = round_snapshot();
+        let hotkey = generate_random_voting_hotkey(Profile::Demo.network()).unwrap();
+        let other = generate_random_voting_hotkey(Profile::Demo.network()).unwrap();
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id("negative-import-test");
+        assert!(import_delegation_capability(
             &db,
-            &round.round_id,
-            0,
-            &[DraftVote {
+            capability_json(&hotkey).unwrap().as_bytes(),
+            ImportDelegationCapabilityParams {
+                voting_hotkey: &other,
+                expected_chain_id: &round.chain_id,
+                expected_network: round.profile.network(),
+                expected_round_params: &round.params,
+                session_json: None,
+            }
+        )
+        .is_err());
+        let mut wrong = round.params.clone();
+        wrong.vote_round_id = "ab".repeat(32);
+        assert!(import_delegation_capability(
+            &db,
+            capability_json(&hotkey).unwrap().as_bytes(),
+            ImportDelegationCapabilityParams {
+                voting_hotkey: &hotkey,
+                expected_chain_id: &round.chain_id,
+                expected_network: round.profile.network(),
+                expected_round_params: &wrong,
+                session_json: None,
+            }
+        )
+        .is_err());
+        assert_eq!(db.get_bundle_count(&round.round_id).unwrap(), 0);
+    }
+    struct LostReply {
+        inner: Arc<DemoTransport>,
+        lost: std::sync::atomic::AtomicBool,
+    }
+    impl ChainTransport for LostReply {
+        fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
+            self.inner.chain_get(request)
+        }
+        fn chain_post_json<'a>(
+            &'a self,
+            request: ChainHttpRequest,
+            body: Vec<u8>,
+        ) -> ChainTransportFuture<'a> {
+            Box::pin(async move {
+                let response = self.inner.chain_post_json(request, body).await?;
+                if !self.lost.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    Err(ChainTransportError::possibly_dispatched(
+                        "simulated lost response after chain commit",
+                    ))
+                } else {
+                    Ok(response)
+                }
+            })
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "generates real proofs and reconciles a landed batch whose POST response was lost"]
+    async fn ambiguous_post_recovers_without_duplicate_commitments() {
+        run_proof_recovery(false, true).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "generates four real vote proofs and tests durable atomic-batch recovery"]
+    async fn demo_generates_and_confirms_a_real_vote_proof() {
+        run_proof_recovery(false, false).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "generates real proofs, prevents expired POSTs, and resumes the same durable work"]
+    async fn expired_transport_preserves_prepared_votes_for_recovery() {
+        run_proof_recovery(true, false).await;
+    }
+    async fn run_proof_recovery(expired_first: bool, lost_reply: bool) {
+        let root = std::env::temp_dir().join(format!("custody-v5-proof-{}", uuid::Uuid::new_v4()));
+        let paths = crate::storage::profile_paths(&root, Profile::Demo).unwrap();
+        let round = round_snapshot();
+        let hotkey = generate_random_voting_hotkey(Profile::Demo.network()).unwrap();
+        let choices = vec![
+            VoteChoiceInput {
                 proposal_id: 1,
                 choice: 1,
-                num_options: 3,
-                vc_tree_position: 0,
-                single_share: true,
-            }],
-            &initial_witness,
-            VoteSigner::hotkey(&hotkey),
-            &NoopProgressReporter,
-        )
-        .unwrap();
-        let commitment = signed.commitments.first().unwrap();
-        let (tx_hash, vc_position) = confirm_vote(&db, &round.round_id, 0, commitment).unwrap();
-        assert_eq!(tx_hash.len(), 64);
-        assert_eq!(vc_position, 3);
-        let next_witness = witness(&db, &round.round_id, 0).unwrap();
-        assert_eq!(next_witness.position, 2);
-        let second = commit_batch(
-            &db,
-            &round.round_id,
-            0,
-            &[DraftVote {
+            },
+            VoteChoiceInput {
                 proposal_id: 2,
                 choice: 0,
-                num_options: 2,
-                vc_tree_position: 0,
-                single_share: true,
-            }],
-            &next_witness,
-            VoteSigner::hotkey(&hotkey),
-            &NoopProgressReporter,
+            },
+        ];
+        let db = Arc::new(crate::storage::open_db(&paths, Profile::Demo).unwrap());
+        import(&db, &round, &hotkey);
+        let mut saved_proofs = Vec::new();
+        if expired_first {
+            let transport = DemoTransport::new(Arc::clone(&db), &round).unwrap();
+            let executor = RoundExecutor::with_transport(
+                Arc::clone(&db),
+                voter::VotingWindowTransport {
+                    inner: transport.clone(),
+                    vote_end_time: 0,
+                },
+                voter::chain_config(&round),
+                HelperClient::new(Arc::new(DemoHelper), HelperHealth::default()),
+            )
+            .unwrap()
+            .with_binding(voter::round_binding(&round, &hotkey))
+            .unwrap()
+            .with_tree_transport(transport.clone());
+            let report = voter::drive_round(
+                &executor,
+                &round,
+                &choices,
+                &hotkey,
+                Some(transport.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(!matches!(report.quiescence, RoundQuiescence::NoWorkLeft));
+            assert!(
+                transport.state.lock().unwrap().bodies.is_empty(),
+                "expired transport must not POST"
+            );
+            let conn = db.conn();
+            let mut stmt = conn.prepare("SELECT bundle_index,proposal_id,commitment_bundle_json FROM votes ORDER BY bundle_index,proposal_id").unwrap();
+            saved_proofs = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, u32>(0)?,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(saved_proofs.len(), 4);
+        }
+        let transport = DemoTransport::new(Arc::clone(&db), &round).unwrap();
+        if lost_reply {
+            let executor = RoundExecutor::with_transport(
+                Arc::clone(&db),
+                LostReply {
+                    inner: transport.clone(),
+                    lost: std::sync::atomic::AtomicBool::new(false),
+                },
+                voter::chain_config(&round),
+                HelperClient::new(Arc::new(DemoHelper), HelperHealth::default()),
+            )
+            .unwrap()
+            .with_binding(voter::round_binding(&round, &hotkey))
+            .unwrap()
+            .with_tree_transport(transport.clone());
+            let _ = voter::drive_round(
+                &executor,
+                &round,
+                &choices,
+                &hotkey,
+                Some(transport.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let executor = RoundExecutor::with_transport(
+            Arc::clone(&db),
+            transport.clone(),
+            voter::chain_config(&round),
+            HelperClient::new(Arc::new(DemoHelper), HelperHealth::default()),
+        )
+        .unwrap()
+        .with_binding(voter::round_binding(&round, &hotkey))
+        .unwrap()
+        .with_tree_transport(transport.clone());
+        let report = voter::drive_round(
+            &executor,
+            &round,
+            &choices,
+            &hotkey,
+            Some(transport.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(
+            matches!(
+                report.quiescence,
+                RoundQuiescence::BackgroundShareWorkOnly { .. } | RoundQuiescence::NoWorkLeft
+            ),
+            "{:?}",
+            report.quiescence
+        );
+        for (bundle, proposal, proof) in saved_proofs {
+            let current: String = db.conn().query_row("SELECT commitment_bundle_json FROM votes WHERE bundle_index=?1 AND proposal_id=?2", (bundle,proposal), |r| r.get(0)).unwrap();
+            let mut original: Value = serde_json::from_str(&proof).unwrap();
+            let mut resumed: Value = serde_json::from_str(&current).unwrap();
+            // Confirmation adds the public position; all proof/signature/share
+            // material must remain byte-for-byte equivalent.
+            original.as_object_mut().unwrap().remove("vc_tree_position");
+            resumed.as_object_mut().unwrap().remove("vc_tree_position");
+            assert!(
+                original == resumed,
+                "retry must preserve proof and encrypted shares"
+            );
+        }
+        let before = crate::storage::vote_records(&paths, Profile::Demo, &round.round_id).unwrap();
+        assert_eq!(before.len(), 4);
+        assert!(before
+            .iter()
+            .all(|v| (lost_reply || v.tx_hash.is_some()) && v.vc_tree_position.is_some()));
+        assert_eq!(
+            transport.state.lock().unwrap().tree.size(),
+            8,
+            "two delegation leaves and two batches, without duplicates"
+        );
+        for bundle in 0..2 {
+            let votes = before
+                .iter()
+                .filter(|v| v.bundle_index == bundle)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                votes[0].tx_hash, votes[1].tx_hash,
+                "one atomic tx per bundle"
+            );
+        }
+        let helpers = HelperClient::new(Arc::new(DemoHelper), HelperHealth::default());
+        let host = zcash_voting::share_tracking_drive::ShareTrackingHostSourceBridge::new(|| {
+            ShareTrackingHostContext {
+                configured_helper_urls: voter::server_urls(&round),
+                now_seconds: round.vote_end_time - 1,
+                vote_end_time_seconds: Some(round.vote_end_time),
+            }
+        });
+        let tracked = ShareTrackingDriver::new(&db, &helpers, &round.round_id)
+            .with_policy(ShareTrackingDrivePolicy {
+                max_passes: Some(1),
+                ..Default::default()
+            })
+            .run(
+                &host,
+                &ChainSubmissionControl::new(0),
+                &NoopShareTrackingReporter::default(),
+            )
+            .await;
+        assert!(tracked.failures.is_empty(), "{:?}", tracked.failures);
+        let progress = crate::storage::round_progress(
+            &paths,
+            Profile::Demo,
+            &round.round_id,
+            true,
+            true,
+            &round.vote_servers,
         )
         .unwrap();
-        let commitment = second.commitments.first().unwrap();
-        let (_, vc_position) = confirm_vote(&db, &round.round_id, 0, commitment).unwrap();
-        assert_eq!(vc_position, 5);
-        assert_eq!(witness(&db, &round.round_id, 0).unwrap().position, 4);
+        assert_eq!(
+            progress.confirmed_share_count,
+            progress.required_share_count
+        );
+        drop(executor);
+        drop(db);
+        let db = Arc::new(crate::storage::open_db(&paths, Profile::Demo).unwrap());
+        let (executor, tree) = super::executor(Arc::clone(&db), &round, &hotkey).unwrap();
+        let report = voter::drive_round(&executor, &round, &choices, &hotkey, Some(tree), None)
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(
+            matches!(report.quiescence, RoundQuiescence::NoWorkLeft),
+            "{:?}",
+            report.quiescence
+        );
+        assert_eq!(
+            before,
+            crate::storage::vote_records(&paths, Profile::Demo, &round.round_id).unwrap()
+        );
+        drop(executor);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -18,10 +18,10 @@ The hotkey is stored in the operating-system credential store. The React UI rece
 ## Recovery guarantees
 
 - A target that already exists is never silently replaced if its Keychain hotkey is missing.
-- A newly imported custody payload is removed from the voting database if manifest persistence fails. An interrupted prior import remains visible as incomplete and can be finalized by importing the same payload again.
+- An imported custody payload remains in the voting database if manifest persistence fails. Importing the same payload again finalizes the manifest without replacing its recovery state.
 - Vote proof and signature recovery data are persisted before broadcast.
 - Repeating a vote action recovers the same persisted commitment when the choice matches; a conflicting choice is rejected.
-- After a round closes, already submitted votes can still be confirmed and finish helper delivery. New or signed-but-unsubmitted votes are never broadcast outside the active window.
+- New proof generation requires an active round. Chain reconciliation uses the SDK’s durable submission state, with network POSTs refused after vote end. Helper tracking stops at vote end; unconfirmed shares must not be presented as a completed vote.
 - Helper acknowledgements are persisted before incomplete delivery is reported, so retries retain acceptances from earlier attempts.
 - Backup restoration validates all hotkeys before changing state, replaces only the selected profile even when its local manifest is damaged, and rolls back Keychain changes if file activation fails.
 - Application reset uses every readable manifest and voting database, so a damaged manifest cannot block destructive recovery.
