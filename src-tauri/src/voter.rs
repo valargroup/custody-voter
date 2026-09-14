@@ -1,43 +1,31 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use rand::{rngs::OsRng, RngCore};
-use reqwest::Client;
-use rusqlite::named_params;
-use tauri::{AppHandle, Emitter};
-use zcash_voting::{
-    confirmation::{confirm_delegation_submission, confirm_vote_submission},
-    delegation_capability::{
-        import_delegation_capability, ImportDelegationCapabilityParams,
-        MAX_DELEGATION_CAPABILITY_JSON_BYTES,
-    },
-    hotkey::generate_random_voting_hotkey,
-    precompute::{reset_vote_tree, sync_vote_tree, van_witness},
-    round::VotingDb,
-    share_policy::{
-        is_last_moment, last_moment_buffer_seconds, plan_share_submissions,
-        share_submission_random_bytes_required, share_submission_target_count,
-    },
-    vote::{
-        commit_batch, recover_signed_commitments, CommittedVote, DraftVote, SignedVoteCommitment,
-        VanWitness, VoteCommitStage, VoteSigner,
-    },
-    wire::{VoteCommitmentWire, VoteShareWire, VotingHotkeyTargetV1},
-    VoteCommitStageBridge, VotingHotkey, VotingRoundParams,
-};
-use zeroize::Zeroizing;
-
 use crate::{
-    chain,
     model::{
         CastVotesResult, ImportResult, Profile, RoundSnapshot, StoredRound, TargetResult,
         VoteChoiceInput, VoteProgressEvent, VoteTransactionResult,
     },
     storage::{load_hotkey, open_db, read_manifest, store_hotkey, write_manifest, ProfilePaths},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use reqwest::Client;
+use rusqlite::named_params;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tauri::{AppHandle, Emitter};
+use zcash_voting::{
+    delegation_capability::{
+        import_delegation_capability, ImportDelegationCapabilityParams,
+        MAX_DELEGATION_CAPABILITY_JSON_BYTES,
+    },
+    hotkey::generate_random_voting_hotkey,
+    prelude::*,
+    round_drive::{RoundDriveReporterBridge, RoundHostSourceBridge},
+    wire::VotingHotkeyTargetV1,
+    HyperTransport, VotingRoundParams,
+};
+use zeroize::Zeroizing;
 
 pub fn target_json(
     hotkey: &VotingHotkey,
@@ -145,11 +133,7 @@ pub async fn import_capability(
     })?;
     validate_stored_round(stored, &round)?;
     let hotkey = load_hotkey(profile, &round.round_id)?;
-    let db = open_db(paths, profile)?;
-    let had_imported_capability = db
-        .get_bundle_count(&round.round_id)
-        .map_err(|error| format!("load existing custody payload state failed: {error}"))?
-        > 0;
+    let db = Arc::new(open_db(paths, profile)?);
     let digest = import_delegation_capability(
         &db,
         &capability_bytes,
@@ -170,13 +154,7 @@ pub async fn import_capability(
         .expect("stored round was checked above");
     stored.snapshot = round.clone();
     stored.capability_digest = Some(digest.clone());
-    persist_capability_manifest(
-        paths,
-        &manifest,
-        &db,
-        &round.round_id,
-        had_imported_capability,
-    )?;
+    persist_capability_manifest(paths, &manifest)?;
 
     if profile.is_demo() {
         // The demo keeps confirmation as an explicit customer-visible step.
@@ -189,24 +167,10 @@ pub async fn import_capability(
 fn persist_capability_manifest(
     paths: &ProfilePaths,
     manifest: &crate::model::ProfileManifest,
-    db: &VotingDb,
-    round_id: &str,
-    had_imported_capability: bool,
 ) -> Result<(), String> {
-    if let Err(error) = write_manifest(paths, manifest) {
-        if had_imported_capability {
-            return Err(format!(
-                "{error}; retry the same custody payload to finish local recovery"
-            ));
-        }
-        return match db.delete_round(round_id) {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(format!(
-                "{error}; rolling back the imported custody payload also failed: {rollback_error}"
-            )),
-        };
-    }
-    Ok(())
+    // An imported capability represents an already-broadcast delegation. Its
+    // recovery state must survive even if the separate UI manifest cannot be written.
+    write_manifest(paths,manifest).map_err(|error|format!("{error}; custody recovery state was preserved; retry the same payload to finish local recovery"))
 }
 
 pub async fn refresh_delegations(
@@ -225,9 +189,9 @@ pub async fn refresh_delegations(
         .capability_digest
         .clone()
         .ok_or_else(|| "import the custody payload before checking confirmations".to_string())?;
-    let db = open_db(paths, profile)?;
+    let db = Arc::new(open_db(paths, profile)?);
     if profile.is_demo() {
-        crate::demo::confirm_delegations(&db, &round.round_id)?;
+        crate::demo::confirm_delegations(Arc::clone(&db), round).await?;
     } else {
         refresh_delegations_once(client, &db, round).await?;
     }
@@ -235,47 +199,60 @@ pub async fn refresh_delegations(
 }
 
 async fn refresh_delegations_once(
-    client: &Client,
-    db: &VotingDb,
+    _client: &Client,
+    db: &Arc<VotingDb>,
     round: &RoundSnapshot,
 ) -> Result<(), String> {
-    let rows = delegation_rows(db, &round.round_id)?;
-    for (bundle_index, tx_hash, position) in rows {
+    if round.profile.is_demo() {
+        return crate::demo::confirm_delegations(Arc::clone(db), round).await;
+    }
+    let client = ChainSubmissionClient::new(Arc::clone(db), chain_config(round))
+        .map_err(|e| format!("create delegation client failed: {e}"))?;
+    let control = ChainSubmissionControl::new(0);
+    for (bundle_index, _, position) in delegation_rows(db, &round.round_id)? {
         if position.is_some() {
             continue;
         }
-        let Some(confirmation) = chain::get_validated_tx_confirmation(
-            client,
-            &round.vote_servers,
-            &tx_hash,
-            |confirmation| {
-                confirm_delegation_submission(
-                    db,
-                    &round.round_id,
+        let result = client
+            .advance_imported_delegation(
+                AdvanceImportedDelegation {
+                    vote_round_id: round_bytes(round)?,
                     bundle_index,
-                    &tx_hash,
-                    &confirmation.events,
-                )
-                .map(|_| ())
-                .map_err(|error| format!("confirm custody delegation failed: {error}"))
-            },
-        )
-        .await?
-        else {
-            continue;
-        };
-        if confirmation.code != 0 {
-            return Err(if confirmation.log.trim().is_empty() {
-                format!(
-                    "delegation transaction {tx_hash} failed with code {}",
-                    confirmation.code
-                )
-            } else {
-                confirmation.log
-            });
+                },
+                &control,
+            )
+            .await
+            .map_err(|e| format!("confirm custody delegation failed: {e}"))?;
+        match result {
+            ChainSubmissionResult::Rejected(diagnostic)
+            | ChainSubmissionResult::SubmittedWithoutHash(diagnostic) => {
+                return Err(format!("delegation could not be confirmed: {diagnostic:?}"))
+            }
+            _ => (),
         }
     }
     Ok(())
+}
+
+pub fn round_bytes(round: &RoundSnapshot) -> Result<[u8; 32], String> {
+    hex::decode(&round.round_id)
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "round id must contain 32 bytes".to_string())
+}
+pub fn chain_config(round: &RoundSnapshot) -> ChainSubmissionClientConfig {
+    ChainSubmissionClientConfig::for_network(round.profile.network(), server_urls(round))
+        .with_vote_chain_id(&round.chain_id)
+}
+pub fn server_urls(round: &RoundSnapshot) -> Vec<String> {
+    round
+        .vote_servers
+        .iter()
+        .map(|server| server.url.clone())
+        .collect()
+}
+pub fn helper_client() -> HelperClient {
+    HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default())
 }
 
 fn import_result(db: &VotingDb, round_id: &str, digest: String) -> Result<ImportResult, String> {
@@ -346,7 +323,7 @@ pub fn demo_capability(_paths: &ProfilePaths, round_id: &str) -> Result<String, 
 
 pub async fn cast_votes(
     app: AppHandle,
-    client: Client,
+    _client: Client,
     paths: ProfilePaths,
     profile: Profile,
     round: RoundSnapshot,
@@ -354,714 +331,495 @@ pub async fn cast_votes(
 ) -> Result<CastVotesResult, String> {
     require_round_context(profile, &round)?;
     validate_choices(&round, &choices)?;
-
     let manifest = read_manifest(&paths, profile)?;
     let stored = manifest
         .rounds
         .get(&round.round_id)
-        .ok_or_else(|| "generate a voting target before voting".to_string())?;
+        .ok_or("generate a voting target before voting")?;
     validate_stored_round(stored, &round)?;
     if stored.capability_digest.is_none() {
-        return Err("import the custody payload before voting".to_string());
+        return Err("import the custody payload before voting".into());
     }
-
-    let db = open_db(&paths, profile)?;
-    if profile.is_demo() {
-        crate::demo::confirm_delegations(&db, &round.round_id)?;
-    } else {
-        refresh_delegations_once(&client, &db, &round).await?;
-    }
-    let pending = delegation_rows(&db, &round.round_id)?
-        .into_iter()
-        .filter_map(|(index, _, position)| position.is_none().then_some(index))
-        .collect::<Vec<_>>();
-    if !pending.is_empty() {
-        return Err(format!(
-            "custody delegation is still unconfirmed for bundle(s) {}; try Check confirmation again shortly",
-            pending
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    let bundle_count = db
-        .get_bundle_count(&round.round_id)
-        .map_err(|error| format!("load delegated bundle count failed: {error}"))?;
-    drop(db);
-
-    emit_progress(
-        &app,
-        &round.round_id,
-        "starting",
-        None,
-        None,
-        None,
-        format!(
-            "Preparing {} proof-backed vote{}",
-            bundle_count * choices.len() as u32,
-            if bundle_count * choices.len() as u32 == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ),
-    );
-
-    let mut transactions = Vec::new();
-    let mut proof_count = 0u32;
-    for bundle_index in 0..bundle_count {
-        for choice in &choices {
-            let proposal = round
-                .proposals
-                .iter()
-                .find(|proposal| proposal.id == choice.proposal_id)
-                .expect("choices were validated against proposals");
-            let existing = existing_vote(
-                &paths,
-                profile,
-                &round.round_id,
-                bundle_index,
-                choice.proposal_id,
-            )?;
-            if let Some(existing) = &existing {
-                if existing.choice != choice.choice {
-                    return Err(format!(
-                        "bundle {bundle_index}, proposal {} was already committed with a different choice",
-                        choice.proposal_id
-                    ));
-                }
-            }
-            if !profile.is_demo() {
-                ensure_vote_can_continue(profile, &round, existing.as_ref(), unix_seconds()?)?;
-            }
-
-            let single_share = if profile.is_demo() {
-                true
-            } else if let Some(start) = round.ceremony_start_time {
-                is_last_moment(unix_seconds()?, start, round.vote_end_time)
-            } else {
-                false
-            };
-            let draft = DraftVote {
-                proposal_id: choice.proposal_id,
-                choice: choice.choice,
-                num_options: proposal.options.len() as u32,
-                vc_tree_position: 0,
-                single_share,
-            };
-            let commitment = if existing.is_some() {
-                emit_progress(
-                    &app,
-                    &round.round_id,
-                    "recovering",
-                    Some(bundle_index),
-                    Some(choice.proposal_id),
-                    None,
-                    "Recovering the persisted signed vote".to_string(),
-                );
-                recover_one(
-                    &paths,
-                    profile,
-                    &round.round_id,
-                    bundle_index,
-                    choice.proposal_id,
-                )
-                .await?
-            } else {
-                let witness = if profile.is_demo() {
-                    let paths = paths.clone();
-                    let round_id = round.round_id.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        let db = open_db(&paths, profile)?;
-                        crate::demo::witness(&db, &round_id, bundle_index)
-                    })
-                    .await
-                    .map_err(|error| format!("demo witness task failed: {error}"))??
-                } else {
-                    sync_and_witness(
-                        app.clone(),
-                        paths.clone(),
-                        profile,
-                        round.round_id.clone(),
-                        bundle_index,
-                        round.vote_servers.clone(),
-                    )
-                    .await?
-                };
-                build_commitment(
-                    app.clone(),
-                    paths.clone(),
-                    profile,
-                    round.round_id.clone(),
-                    bundle_index,
-                    draft,
-                    witness,
-                )
-                .await?
-            };
-            proof_count = proof_count.saturating_add(1);
-
-            let existing = existing_vote(
-                &paths,
-                profile,
-                &round.round_id,
-                bundle_index,
-                choice.proposal_id,
-            )?;
-            let (tx_hash, vc_tree_position, shares_submitted) = if profile.is_demo() {
-                finish_demo_vote(&paths, &round, bundle_index, &commitment, existing)?
-            } else {
-                finish_live_vote(
-                    &app,
-                    &client,
-                    &paths,
-                    profile,
-                    &round,
-                    bundle_index,
-                    &commitment,
-                    existing,
-                    single_share,
-                )
-                .await?
-            };
-            transactions.push(VoteTransactionResult {
-                bundle_index,
-                proposal_id: choice.proposal_id,
-                tx_hash,
-                vc_tree_position,
-                shares_submitted,
-            });
+    let hotkey = load_hotkey(profile, &round.round_id)?;
+    let db = Arc::new(open_db(&paths, profile)?);
+    // Keep the application's original no-revote contract, including signed work
+    // that has not reached the chain yet. The SDK owns all subsequent recovery.
+    for vote in crate::storage::vote_records(&paths, profile, &round.round_id)? {
+        if choices
+            .iter()
+            .any(|c| c.proposal_id == vote.proposal_id && c.choice != vote.choice)
+        {
+            return Err(format!(
+                "proposal {} already has a persisted vote with a different choice",
+                vote.proposal_id
+            ));
         }
     }
+    let report = if profile.is_demo() {
+        let (executor, tree) = crate::demo::executor(Arc::clone(&db), &round, &hotkey)?;
+        drive_round(&executor, &round, &choices, &hotkey, Some(tree), Some(&app)).await?
+    } else {
+        let executor = RoundExecutor::with_transport(
+            Arc::clone(&db),
+            VotingWindowTransport {
+                inner: HyperTransport::new(),
+                vote_end_time: round.vote_end_time,
+            },
+            chain_config(&round),
+            helper_client(),
+        )
+        .map_err(|e| e.to_string())?
+        .with_binding(round_binding(&round, &hotkey))
+        .map_err(|e| e.to_string())?;
+        drive_round(&executor, &round, &choices, &hotkey, None, Some(&app)).await?
+    };
+    let (outcome, message) = describe_run(&report);
+    let share_rows = zcash_voting::share::list(&db, &round.round_id).map_err(|e| e.to_string())?;
+    let transactions = crate::storage::vote_records(&paths, profile, &round.round_id)?
+        .into_iter()
+        .filter_map(|vote| {
+            Some(VoteTransactionResult {
+                bundle_index: vote.bundle_index,
+                proposal_id: vote.proposal_id,
+                tx_hash: vote.tx_hash?,
+                vc_tree_position: vote.vc_tree_position?,
+                shares_submitted: share_rows
+                    .iter()
+                    .filter(|s| {
+                        s.bundle_index == vote.bundle_index
+                            && s.proposal_id == vote.proposal_id
+                            && (s.confirmed
+                                || (!s.sent_to_urls.is_empty()
+                                    && s.sent_to_urls.len() >= s.target_count.max(1) as usize))
+                    })
+                    .count() as u32,
+            })
+        })
+        .collect();
+    let progress = crate::storage::round_progress(
+        &paths,
+        profile,
+        &round.round_id,
+        true,
+        true,
+        &round.vote_servers,
+    )?;
     emit_progress(
         &app,
         &round.round_id,
-        "complete",
+        &outcome,
         None,
         None,
-        Some(1.0),
-        if profile.is_demo() {
-            "Local proof rehearsal completed. Nothing was broadcast.".to_string()
-        } else {
-            "All votes were confirmed and helper shares were submitted.".to_string()
-        },
+        None,
+        message.clone(),
     );
     Ok(CastVotesResult {
         demo: profile.is_demo(),
-        proof_count,
+        proof_count: progress.vote_count,
         transactions,
+        outcome,
+        message,
+        shares_delivered: progress.submitted_share_count,
+        shares_confirmed: progress.confirmed_share_count,
     })
 }
 
-#[derive(Clone, Debug)]
-struct ExistingVote {
-    choice: u32,
-    tx_hash: Option<String>,
-    vc_tree_position: Option<u64>,
+/// Keep SDK reconciliation available after close, but refuse any new network POST.
+pub struct VotingWindowTransport<T> {
+    pub inner: T,
+    pub vote_end_time: u64,
 }
-
-fn existing_vote(
-    paths: &ProfilePaths,
-    profile: Profile,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-) -> Result<Option<ExistingVote>, String> {
-    let db = open_db(paths, profile)?;
-    let wallet = db.wallet_id();
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT choice, tx_hash, vc_tree_position
-         FROM votes
-         WHERE round_id = :round_id AND wallet_id = :wallet_id
-           AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
-        named_params! {
-            ":round_id": round_id,
-            ":wallet_id": wallet,
-            ":bundle_index": bundle_index,
-            ":proposal_id": proposal_id,
-        },
-        |row| {
-            Ok(ExistingVote {
-                choice: row.get(0)?,
-                tx_hash: row.get(1)?,
-                vc_tree_position: row.get(2)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|error| format!("load existing vote failed: {error}"))
-}
-
-use rusqlite::OptionalExtension;
-
-async fn sync_and_witness(
-    app: AppHandle,
-    paths: ProfilePaths,
-    profile: Profile,
-    round_id: String,
-    bundle_index: u32,
-    servers: Vec<crate::model::ServiceEndpointView>,
-) -> Result<VanWitness, String> {
-    emit_progress(
-        &app,
-        &round_id,
-        "syncing_tree",
-        Some(bundle_index),
-        None,
-        None,
-        "Synchronizing the authenticated vote tree".to_string(),
-    );
-    tauri::async_runtime::spawn_blocking(move || {
-        let db = open_db(&paths, profile)?;
-        let mut errors = Vec::new();
-        for server in servers {
-            match sync_vote_tree(&db, &round_id, &server.url) {
-                Ok(height) => {
-                    return van_witness(&db, &round_id, bundle_index, height)
-                        .map_err(|error| format!("generate VAN witness failed: {error}"));
-                }
-                Err(error) => {
-                    errors.push(format!("{}: {error}", server.label));
-                    let _ = reset_vote_tree(&db, &round_id);
-                }
+impl<T: ChainTransport> ChainTransport for VotingWindowTransport<T> {
+    fn chain_get<'a>(
+        &'a self,
+        request: ChainHttpRequest,
+    ) -> zcash_voting::chain_submission::ChainTransportFuture<'a> {
+        self.inner.chain_get(request)
+    }
+    fn chain_post_json<'a>(
+        &'a self,
+        request: ChainHttpRequest,
+        body: Vec<u8>,
+    ) -> zcash_voting::chain_submission::ChainTransportFuture<'a> {
+        self.chain_post_json_with_dispatch(
+            request,
+            body,
+            zcash_voting::chain_submission::ChainPostDispatch::default(),
+        )
+    }
+    fn chain_post_json_with_dispatch<'a>(
+        &'a self,
+        request: ChainHttpRequest,
+        body: Vec<u8>,
+        dispatch: zcash_voting::chain_submission::ChainPostDispatch,
+    ) -> zcash_voting::chain_submission::ChainTransportFuture<'a> {
+        Box::pin(async move {
+            if unix_seconds().map_err(ChainTransportError::definitely_unsent)? >= self.vote_end_time
+            {
+                return Err(ChainTransportError::definitely_unsent(
+                    "voting has ended; saved transaction retained for reconciliation",
+                ));
             }
-        }
-        Err(format!(
-            "all vote-tree servers failed: {}",
-            errors.join("; ")
-        ))
-    })
-    .await
-    .map_err(|error| format!("vote-tree synchronization task failed: {error}"))?
+            self.inner
+                .chain_post_json_with_dispatch(request, body, dispatch)
+                .await
+        })
+    }
 }
 
-async fn build_commitment(
-    app: AppHandle,
-    paths: ProfilePaths,
-    profile: Profile,
-    round_id: String,
-    bundle_index: u32,
-    draft: DraftVote,
-    witness: VanWitness,
-) -> Result<SignedVoteCommitment, String> {
-    let hotkey = load_hotkey(profile, &round_id)?;
-    let secret = Zeroizing::new(hotkey.stored_secret().to_vec());
-    tauri::async_runtime::spawn_blocking(move || {
-        let progress_app = app.clone();
-        let progress_round = round_id.clone();
-        let reporter = VoteCommitStageBridge::new(move |stage| {
-            let (phase, proposal_id, bundle, progress, message) = match stage {
-                VoteCommitStage::ProofStarting {
-                    proposal_id,
-                    bundle_index,
-                } => (
-                    "proving",
-                    Some(proposal_id),
-                    Some(bundle_index),
-                    Some(0.0),
-                    "Generating a zero-knowledge vote proof".to_string(),
-                ),
-                VoteCommitStage::ProofProgress {
-                    proposal_id,
-                    bundle_index,
-                    progress,
-                } => (
-                    "proving",
-                    Some(proposal_id),
-                    Some(bundle_index),
-                    Some(progress),
-                    "Generating a zero-knowledge vote proof".to_string(),
-                ),
-                VoteCommitStage::SharePayloadsBuilding {
-                    proposal_id,
-                    bundle_index,
-                } => (
-                    "building_shares",
-                    Some(proposal_id),
-                    Some(bundle_index),
-                    Some(1.0),
-                    "Preparing encrypted recovery shares".to_string(),
-                ),
-                VoteCommitStage::Signing {
-                    proposal_id,
-                    bundle_index,
-                } => (
-                    "signing",
-                    Some(proposal_id),
-                    Some(bundle_index),
-                    None,
-                    "Signing the vote with the customer hotkey".to_string(),
-                ),
-                _ => ("proving", None, None, None, "Preparing vote".to_string()),
-            };
-            emit_progress(
-                &progress_app,
-                &progress_round,
-                phase,
-                bundle,
-                proposal_id,
-                progress,
-                message,
-            );
+pub fn round_binding(round: &RoundSnapshot, hotkey: &VotingHotkey) -> RoundBinding {
+    RoundBinding {
+        round_id: round.round_id.clone(),
+        network: round.profile.network(),
+        proposals: round
+            .proposals
+            .iter()
+            .map(|p| ProposalRosterEntry {
+                proposal_id: p.id,
+                num_options: p.options.len() as u32,
+            })
+            .collect(),
+        hotkey_secret: Some(Zeroizing::new(hotkey.stored_secret().to_vec())),
+    }
+}
+
+pub async fn drive_round<T: ChainTransport>(
+    executor: &RoundExecutor<T>,
+    round: &RoundSnapshot,
+    choices: &[VoteChoiceInput],
+    hotkey: &VotingHotkey,
+    tree_transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
+    app: Option<&AppHandle>,
+) -> Result<RoundRunReport, String> {
+    validate_choices(round, choices)?;
+    let now = unix_seconds()?;
+    let active = round.profile.is_demo() || (round.is_active && now < round.vote_end_time);
+    if active {
+        executor
+            .set_ballot_intents(
+                &choices
+                    .iter()
+                    .map(|c| BallotIntent {
+                        proposal_id: c.proposal_id,
+                        decision: Decision::Choice(c.choice),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| e.to_string())?;
+    } else {
+        let plan = executor.plan().map_err(|e| e.to_string())?;
+        if now < round.vote_end_time
+            && plan
+                .next_steps
+                .iter()
+                .any(|s| matches!(s, NextStep::CastVote { .. } | NextStep::Delegate { .. }))
+        {
+            return Err("this round is not active for casting".into());
+        }
+        // Expired rounds keep their durable intents. The executor checks the
+        // refreshed deadline before each new cast while reconciling old work.
+    }
+    let control = ChainSubmissionControl::new(0);
+    let host_control = control.clone();
+    let host = RoundHostSourceBridge::new(|| {
+        let now = unix_seconds().unwrap_or_else(|_| {
+            host_control.cancel();
+            0
         });
-        let db = open_db(&paths, profile)?;
-        let hotkey = VotingHotkey::from_stored_secret(&secret, profile.network())
-            .map_err(|error| format!("reconstruct voting hotkey failed: {error}"))?;
-        let signed = commit_batch(
-            &db,
-            &round_id,
-            bundle_index,
-            &[draft],
-            &witness,
-            VoteSigner::hotkey(&hotkey),
-            &reporter,
-        )
-        .map_err(|error| format!("build signed vote commitment failed: {error}"))?;
-        signed
-            .commitments
-            .into_iter()
-            .next()
-            .ok_or_else(|| "vote proof builder returned no commitment".to_string())
-    })
-    .await
-    .map_err(|error| format!("vote proof task failed: {error}"))?
-}
-
-async fn recover_one(
-    paths: &ProfilePaths,
-    profile: Profile,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-) -> Result<SignedVoteCommitment, String> {
-    let paths = paths.clone();
-    let round_id = round_id.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        let db = open_db(&paths, profile)?;
-        let recovered = recover_signed_commitments(&db, &round_id, bundle_index, proposal_id)
-            .map_err(|error| format!("recover signed vote failed: {error}"))?;
-        recovered
-            .commitments
-            .into_iter()
-            .next()
-            .ok_or_else(|| "recovered vote contains no commitment".to_string())
-    })
-    .await
-    .map_err(|error| format!("vote recovery task failed: {error}"))?
-}
-
-fn finish_demo_vote(
-    paths: &ProfilePaths,
-    round: &RoundSnapshot,
-    bundle_index: u32,
-    commitment: &SignedVoteCommitment,
-    existing: Option<ExistingVote>,
-) -> Result<(String, u64, u32), String> {
-    if let Some(existing) = existing {
-        if let (Some(tx_hash), Some(vc_position)) = (existing.tx_hash, existing.vc_tree_position) {
-            return Ok((tx_hash, vc_position, commitment.share_payloads.len() as u32));
-        }
-    }
-    let db = open_db(paths, Profile::Demo)?;
-    let (tx_hash, vc_position) =
-        crate::demo::confirm_vote(&db, &round.round_id, bundle_index, commitment)?;
-    Ok((tx_hash, vc_position, commitment.share_payloads.len() as u32))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn finish_live_vote(
-    app: &AppHandle,
-    client: &Client,
-    paths: &ProfilePaths,
-    profile: Profile,
-    round: &RoundSnapshot,
-    bundle_index: u32,
-    commitment: &SignedVoteCommitment,
-    existing: Option<ExistingVote>,
-    single_share: bool,
-) -> Result<(String, u64, u32), String> {
-    let mut tx_hash = existing.as_ref().and_then(|vote| vote.tx_hash.clone());
-    let mut vc_position = existing.as_ref().and_then(|vote| vote.vc_tree_position);
-    if tx_hash.is_none() {
-        ensure_vote_can_continue(profile, round, None, unix_seconds()?)?;
-        emit_progress(
-            app,
-            &round.round_id,
-            "submitting_vote",
-            Some(bundle_index),
-            Some(commitment.proposal_id),
-            None,
-            "Submitting the signed vote to the vote chain".to_string(),
-        );
-        let wire = VoteCommitmentWire::try_from(commitment)
-            .map_err(|error| format!("build vote-chain payload failed: {error}"))?;
-        let body = wire
-            .to_json()
-            .map_err(|error| format!("serialize vote-chain payload failed: {error}"))?;
-        let submitted = chain::submit_vote(client, &round.vote_servers, &body).await?;
-        let db = open_db(paths, profile)?;
-        let recovered =
-            CommittedVote::recover(&db, &round.round_id, bundle_index, commitment.proposal_id)
-                .map_err(|error| {
-                    format!("recover vote for submission recording failed: {error}")
-                })?;
-        recovered
-            .record_submission(&db, &submitted.tx_hash)
-            .map_err(|error| format!("record vote submission failed: {error}"))?;
-        tx_hash = Some(submitted.tx_hash);
-    }
-    let tx_hash = tx_hash.expect("vote hash was set above");
-    if vc_position.is_none() {
-        emit_progress(
-            app,
-            &round.round_id,
-            "confirming_vote",
-            Some(bundle_index),
-            Some(commitment.proposal_id),
-            None,
-            "Waiting for vote-chain confirmation".to_string(),
-        );
-        let db = open_db(paths, profile)?;
-        let confirmation = chain::poll_validated_tx_confirmation(
-            client,
-            &round.vote_servers,
-            &tx_hash,
-            |confirmation| {
-                let parsed = confirm_vote_submission(
-                    &db,
-                    &round.round_id,
-                    bundle_index,
-                    commitment.proposal_id,
-                    &tx_hash,
-                    &confirmation.events,
-                )
-                .map_err(|error| format!("record vote confirmation failed: {error}"))?;
-                vc_position = Some(parsed.vc_tree_position);
-                Ok(())
-            },
-        )
-        .await?;
-        if confirmation.code != 0 {
-            return Err(if confirmation.log.trim().is_empty() {
-                format!("vote transaction failed with code {}", confirmation.code)
+        RoundHostContext {
+            configured_helper_urls: server_urls(round),
+            now_seconds: if round.profile.is_demo() {
+                round.vote_end_time - 1
             } else {
-                confirmation.log
+                now
+            },
+            ceremony_start_seconds: round.ceremony_start_time,
+            vote_end_time_seconds: Some(round.vote_end_time),
+            vote_tree_node_urls: server_urls(round),
+            delegation: None,
+            chain_policy: ChainAdvancePolicy::default(),
+            max_proof_concurrency: zcash_voting::vote::DEFAULT_BATCH_PROOF_CONCURRENCY,
+        }
+    });
+    let reporter = RoundDriveReporterBridge::new(|event| {
+        if let Some(app) = app {
+            report_progress(app, &round.round_id, event);
+        }
+    });
+    // v5.0.0's fresh CastVote executor validates custodian-only TX1 fields
+    // (rho_signed) absent from a canonical imported capability. Prepare through
+    // the public custody-compatible proof API instead; all network effects and
+    // recovery still belong to the SDK. One dispatch per pass lets us prepare
+    // newly unlocked drafts after an older singleton finishes, without ever
+    // sending an imported bundle down that custodian-only path.
+    let mut aggregate: Option<RoundRunReport> = None;
+    for _ in 0..512 {
+        if active {
+            prepare_custody_votes(executor, round, hotkey, tree_transport.clone(), app).await?;
+        }
+        let mut report = RoundDriver::new(executor)
+            .with_policy(RoundDrivePolicy {
+                max_dispatches: 1,
+                progress_baseline: ProgressBaseline::SelectedChoices,
+                ..Default::default()
+            })
+            .run(&host, &control, &reporter)
+            .await;
+        if let Some(mut previous) = aggregate.take() {
+            previous.failures.append(&mut report.failures);
+            report.failures = previous.failures;
+            previous.chain_outcomes.append(&mut report.chain_outcomes);
+            report.chain_outcomes = previous.chain_outcomes;
+            previous
+                .share_deliveries
+                .append(&mut report.share_deliveries);
+            report.share_deliveries = previous.share_deliveries;
+            previous.delegations.append(&mut report.delegations);
+            report.delegations = previous.delegations;
+            previous.skipped_bundles.append(&mut report.skipped_bundles);
+            report.skipped_bundles = previous.skipped_bundles;
+        }
+        if !matches!(
+            report.quiescence,
+            RoundQuiescence::PassBudgetExhausted { .. }
+        ) || !report.failures.is_empty()
+        {
+            return Ok(report);
+        }
+        aggregate = Some(report);
+    }
+    aggregate.ok_or_else(|| "voting driver returned no report".into())
+}
+
+async fn prepare_custody_votes<T: ChainTransport>(
+    executor: &RoundExecutor<T>,
+    round: &RoundSnapshot,
+    hotkey: &VotingHotkey,
+    transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
+    app: Option<&AppHandle>,
+) -> Result<(), String> {
+    let db = executor.database();
+    let plan = executor.plan().map_err(|e| e.to_string())?;
+    if plan
+        .delegation_statuses
+        .iter()
+        .any(|s| s.phase != zcash_voting::phases::DelegationPhase::Confirmed)
+    {
+        return Ok(());
+    }
+    let mut bundles = BTreeMap::<u32, Vec<DraftVote>>::new();
+    let now = unix_seconds()?;
+    if !round.profile.is_demo() && now >= round.vote_end_time {
+        return Ok(());
+    }
+    let single_share = round.profile.is_demo()
+        || round.ceremony_start_time.is_some_and(|start| {
+            zcash_voting::share_policy::is_last_moment(now, start, round.vote_end_time)
+        });
+    for step in plan.next_steps {
+        if let NextStep::CastVote {
+            bundle_index,
+            proposal_id,
+            choice,
+        } = step
+        {
+            let proposal = round
+                .proposals
+                .iter()
+                .find(|p| p.id == proposal_id)
+                .ok_or("proposal is absent from authenticated roster")?;
+            bundles.entry(bundle_index).or_default().push(DraftVote {
+                proposal_id,
+                choice,
+                num_options: proposal.options.len() as u32,
+                vc_tree_position: 0,
+                single_share,
             });
         }
     }
-    let vc_position = vc_position.expect("vote confirmation set a VC position");
-    emit_progress(
-        app,
-        &round.round_id,
-        "submitting_shares",
-        Some(bundle_index),
-        Some(commitment.proposal_id),
-        None,
-        "Submitting encrypted recovery shares".to_string(),
-    );
-    let submitted_shares = submit_missing_shares(
-        client,
-        paths,
-        profile,
-        round,
-        bundle_index,
-        commitment,
-        vc_position,
-        single_share,
-    )
-    .await?;
-    Ok((tx_hash, vc_position, submitted_shares))
-}
-
-fn ensure_vote_can_continue(
-    profile: Profile,
-    round: &RoundSnapshot,
-    existing: Option<&ExistingVote>,
-    now: u64,
-) -> Result<(), String> {
-    if profile.is_demo() || existing.and_then(|vote| vote.tx_hash.as_ref()).is_some() {
-        return Ok(());
-    }
-    if !round.is_active {
-        return Err(format!(
-            "round is {}, so a new vote cannot be created or broadcast",
-            round.status_label
-        ));
-    }
-    if round.vote_end_time <= now {
-        return Err("the voting window ended before this vote was broadcast".to_string());
+    for (bundle_index, drafts) in bundles {
+        let db = Arc::clone(&db);
+        let round = round.clone();
+        let transport = transport.clone();
+        let secret = Zeroizing::new(hotkey.stored_secret().to_vec());
+        let app = app.cloned();
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut witness = None;
+            let mut errors = Vec::new();
+            for server in &round.vote_servers {
+                let synced = match &transport {
+                    Some(transport) => zcash_voting::precompute::sync_vote_tree_with(
+                        &db,
+                        &round.round_id,
+                        &server.url,
+                        Arc::clone(transport),
+                    ),
+                    None => {
+                        zcash_voting::precompute::sync_vote_tree(&db, &round.round_id, &server.url)
+                    }
+                }
+                .and_then(|height| {
+                    zcash_voting::precompute::van_witness(
+                        &db,
+                        &round.round_id,
+                        bundle_index,
+                        height,
+                    )
+                });
+                match synced {
+                    Ok(value) => {
+                        witness = Some(value);
+                        break;
+                    }
+                    Err(error) => {
+                        errors.push(error.to_string());
+                        zcash_voting::precompute::reset_vote_tree(&db, &round.round_id)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            let witness = witness.ok_or_else(|| {
+                format!("vote-tree synchronization failed: {}", errors.join("; "))
+            })?;
+            if !round.profile.is_demo() && unix_seconds()? >= round.vote_end_time {
+                return Err("voting ended before proof generation".into());
+            }
+            let hotkey = VotingHotkey::from_stored_secret(&secret, round.profile.network())
+                .map_err(|e| e.to_string())?;
+            let progress_round = round.round_id.clone();
+            let progress_step = NextStep::CastVote {
+                bundle_index,
+                proposal_id: drafts[0].proposal_id,
+                choice: drafts[0].choice,
+            };
+            let reporter = VoteCommitStageBridge::new(move |stage| {
+                if let Some(app) = &app {
+                    report_progress(
+                        app,
+                        &progress_round,
+                        RoundDriveEvent::StepProgress {
+                            step: progress_step.clone(),
+                            progress: RoundStepProgress::VoteCommit(stage),
+                        },
+                    );
+                }
+            });
+            let prepared = zcash_voting::vote::prepare_vote_work(
+                &db,
+                VoteSigner::hotkey(&hotkey),
+                zcash_voting::vote::VoteWorkRequest {
+                    round_id: &round.round_id,
+                    bundle_index,
+                    drafts: &drafts,
+                    witness: &witness,
+                    stages: &reporter,
+                    max_proof_concurrency: zcash_voting::vote::DEFAULT_BATCH_PROOF_CONCURRENCY,
+                },
+            )
+            .map_err(|e| format!("prepare custody vote failed: {e}"))?;
+            zcash_voting::vote::persist_prepared_vote_work(&db, prepared)
+                .map_err(|e| format!("persist custody vote failed: {e}"))?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| format!("custody proof task failed: {e}"))??;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn submit_missing_shares(
-    client: &Client,
-    paths: &ProfilePaths,
-    profile: Profile,
-    round: &RoundSnapshot,
-    bundle_index: u32,
-    commitment: &SignedVoteCommitment,
-    vc_position: u64,
-    single_share: bool,
-) -> Result<u32, String> {
-    let server_urls = round
-        .vote_servers
+fn describe_run(report: &RoundRunReport) -> (String, String) {
+    let (outcome, message) = match &report.quiescence {
+        RoundQuiescence::NoWorkLeft => ("complete", "All votes and helper shares are confirmed."),
+        RoundQuiescence::BackgroundShareWorkOnly { .. } => (
+            "tracking",
+            "Votes are confirmed. Helper shares are being tracked; keep this workspace open.",
+        ),
+        RoundQuiescence::Cancelled => (
+            "pending",
+            "Voting paused. Reopen this round to resume saved work.",
+        ),
+        RoundQuiescence::ChainRecoveryStalled { .. }
+        | RoundQuiescence::PassBudgetExhausted { .. } => (
+            "pending",
+            "Submission is still unresolved. Retry to reconcile the saved transaction.",
+        ),
+        _ => (
+            "blocked",
+            "Voting needs attention. Saved progress has been retained.",
+        ),
+    };
+    let details = report
+        .failures
         .iter()
-        .map(|server| server.url.clone())
-        .collect::<Vec<_>>();
-    if server_urls.is_empty() {
-        return Err("authenticated config has no helper servers".to_string());
-    }
-    let target_count = share_submission_target_count(server_urls.len());
-    let existing = recorded_share_deliveries(
-        paths,
-        profile,
-        &round.round_id,
-        bundle_index,
-        commitment.proposal_id,
-    )?;
-    let now = unix_seconds()?;
-    let buffer = round
-        .ceremony_start_time
-        .and_then(|start| last_moment_buffer_seconds(start, round.vote_end_time));
-    let required = share_submission_random_bytes_required(
-        commitment.share_payloads.len(),
-        server_urls.len(),
-        now,
-        round.vote_end_time,
-        buffer,
-        single_share,
-    );
-    let mut submit_entropy = vec![0u8; required.submit_at_random_bytes];
-    let mut server_entropy = vec![0u8; required.server_random_bytes];
-    OsRng.fill_bytes(&mut submit_entropy);
-    OsRng.fill_bytes(&mut server_entropy);
-    let plans = plan_share_submissions(
-        commitment.share_payloads.len(),
-        &server_urls,
-        now,
-        round.vote_end_time,
-        buffer,
-        single_share,
-        &submit_entropy,
-        &server_entropy,
+        .map(|f| f.failure.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    (
+        outcome.into(),
+        if details.is_empty() {
+            message.into()
+        } else {
+            format!("{message} {details}")
+        },
     )
-    .map_err(|error| format!("plan helper share submissions failed: {error}"))?;
-    let mut submitted_count = 0u32;
-    for (payload, plan) in commitment.share_payloads.iter().zip(plans) {
-        let share_index = payload.enc_share.share_index;
-        let recorded = existing.get(&share_index);
-        let mut accepted = configured_recorded_servers(recorded.map(Vec::as_slice), &server_urls);
-        if accepted.len() >= target_count {
-            submitted_count = submitted_count.saturating_add(1);
-            continue;
-        }
-        let wire = VoteShareWire::from_payload(payload, Some(vc_position), plan.submit_at)
-            .map_err(|error| format!("build helper share payload failed: {error}"))?;
-        let body = wire
-            .to_json()
-            .map_err(|error| format!("serialize helper share payload failed: {error}"))?;
-        let mut candidates = plan.target_servers.clone();
-        for server in &server_urls {
-            if !candidates.contains(server) {
-                candidates.push(server.clone());
-            }
-        }
-        let mut attempted = HashSet::new();
-        let mut newly_accepted = Vec::new();
-        for server in candidates {
-            if accepted.len() >= target_count {
-                break;
-            }
-            if accepted.contains(&server) || !attempted.insert(server.clone()) {
-                continue;
-            }
-            if chain::submit_share(client, &server, &body).await.is_ok()
-                && accepted.insert(server.clone())
-            {
-                newly_accepted.push(server);
-            }
-        }
-        if !newly_accepted.is_empty() {
-            let db = open_db(paths, profile)?;
-            let recovered =
-                CommittedVote::recover(&db, &round.round_id, bundle_index, commitment.proposal_id)
-                    .map_err(|error| format!("recover vote for share recording failed: {error}"))?;
-            if recorded.is_some() {
-                recovered
-                    .add_sent_servers(&db, share_index, &newly_accepted)
-                    .map_err(|error| format!("update helper share submission failed: {error}"))?;
-            } else {
-                recovered
-                    .record_share(&db, share_index, &newly_accepted, plan.submit_at)
-                    .map_err(|error| format!("record helper share submission failed: {error}"))?;
-            }
-        }
-        if accepted.len() < target_count {
-            return Err(format!(
-                "only {} of {} required helpers accepted share {share_index} for proposal {}; retry to resume safely",
-                accepted.len(),
-                target_count,
-                commitment.proposal_id,
-            ));
-        }
-        submitted_count = submitted_count.saturating_add(1);
-    }
-    Ok(submitted_count)
 }
 
-fn recorded_share_deliveries(
-    paths: &ProfilePaths,
-    profile: Profile,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-) -> Result<BTreeMap<u32, Vec<String>>, String> {
-    let db = open_db(paths, profile)?;
-    let wallet = db.wallet_id();
-    let conn = db.conn();
-    let mut statement = conn
-        .prepare(
-            "SELECT share_index, sent_to_urls FROM share_delegations
-             WHERE round_id = :round_id AND wallet_id = :wallet_id
-               AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
-        )
-        .map_err(|error| format!("prepare helper share recovery query failed: {error}"))?;
-    let rows = statement
-        .query_map(
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet,
-                ":bundle_index": bundle_index,
-                ":proposal_id": proposal_id,
-            },
-            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
-        )
-        .map_err(|error| format!("query helper share recovery state failed: {error}"))?;
-    let mut deliveries = BTreeMap::new();
-    for row in rows {
-        let (share_index, sent_to_urls) =
-            row.map_err(|error| format!("decode helper share row failed: {error}"))?;
-        let sent_to_urls = serde_json::from_str(&sent_to_urls)
-            .map_err(|error| format!("decode helper share server list failed: {error}"))?;
-        deliveries.insert(share_index, sent_to_urls);
-    }
-    Ok(deliveries)
-}
-
-fn configured_recorded_servers(
-    recorded: Option<&[String]>,
-    configured: &[String],
-) -> HashSet<String> {
-    recorded
-        .unwrap_or_default()
-        .iter()
-        .filter(|server| configured.contains(server))
-        .cloned()
-        .collect()
+fn report_progress(app: &AppHandle, round_id: &str, event: RoundDriveEvent) {
+    let (phase, bundle, proposal, fraction, message) = match event {
+        RoundDriveEvent::PlanRefreshed { tally, .. } => (
+            "progress",
+            None,
+            None,
+            (tally.total_proposals > 0)
+                .then(|| tally.completed_proposals as f64 / tally.total_proposals as f64),
+            format!(
+                "{} of {} selected proposals submitted",
+                tally.completed_proposals, tally.total_proposals
+            ),
+        ),
+        RoundDriveEvent::StepProgress {
+            progress: RoundStepProgress::VoteCommit(stage),
+            ..
+        } => match stage {
+            VoteCommitStage::ProofStarting {
+                proposal_id,
+                bundle_index,
+            } => (
+                "proving",
+                Some(bundle_index),
+                Some(proposal_id),
+                Some(0.0),
+                "Generating a zero-knowledge vote proof".into(),
+            ),
+            VoteCommitStage::ProofProgress {
+                proposal_id,
+                bundle_index,
+                progress,
+            } => (
+                "proving",
+                Some(bundle_index),
+                Some(proposal_id),
+                Some(progress),
+                "Generating a zero-knowledge vote proof".into(),
+            ),
+            _ => return,
+        },
+        RoundDriveEvent::StepSelected { step } => {
+            let Ok(view) = zcash_voting::wire::NextStepView::try_from(step) else {
+                return;
+            };
+            (
+                "working",
+                Some(view.bundle_index),
+                Some(view.proposal_id),
+                None,
+                "Advancing saved voting work".into(),
+            )
+        }
+        RoundDriveEvent::StepFailed { message, .. } => ("pending", None, None, None, message),
+        _ => return,
+    };
+    emit_progress(app, round_id, phase, bundle, proposal, fraction, message);
 }
 
 fn validate_choices(round: &RoundSnapshot, choices: &[VoteChoiceInput]) -> Result<(), String> {
@@ -1211,95 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_round_allows_only_submitted_votes_to_resume() {
-        let mut round = crate::demo::round_snapshot();
-        round.is_active = false;
-        round.status_label = "Finalized".to_string();
-        round.vote_end_time = 100;
-        let submitted = ExistingVote {
-            choice: 0,
-            tx_hash: Some("submitted-hash".to_string()),
-            vc_tree_position: None,
-        };
-        let signed_only = ExistingVote {
-            choice: 0,
-            tx_hash: None,
-            vc_tree_position: None,
-        };
-
-        assert!(ensure_vote_can_continue(Profile::Testnet, &round, Some(&submitted), 101).is_ok());
-        assert!(
-            ensure_vote_can_continue(Profile::Testnet, &round, Some(&signed_only), 101).is_err()
-        );
-        assert!(ensure_vote_can_continue(Profile::Testnet, &round, None, 101).is_err());
-
-        round.is_active = true;
-        assert!(ensure_vote_can_continue(Profile::Testnet, &round, Some(&submitted), 101).is_ok());
-        assert!(
-            ensure_vote_can_continue(Profile::Testnet, &round, Some(&signed_only), 101)
-                .unwrap_err()
-                .contains("voting window ended")
-        );
-    }
-
-    #[test]
-    fn retry_reuses_persisted_helper_acceptances() {
-        let root = std::env::temp_dir().join(format!(
-            "custody-voter-helper-retry-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = crate::storage::profile_paths(&root, Profile::Testnet).unwrap();
-        let db = open_db(&paths, Profile::Testnet).unwrap();
-        let wallet = db.wallet_id().to_string();
-        db.conn()
-            .execute(
-                "INSERT INTO rounds (
-                    round_id, wallet_id, network, snapshot_height, ea_pk, nc_root,
-                    nullifier_imt_root, created_at
-                 ) VALUES ('round', ?1, 'testnet', 1, X'00', X'00', X'00', 1)",
-                [&wallet],
-            )
-            .unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO bundles (
-                    round_id, wallet_id, bundle_index, total_note_value, van_leaf_position
-                 ) VALUES ('round', ?1, 0, 0, 7)",
-                [&wallet],
-            )
-            .unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO share_delegations (
-                    round_id, wallet_id, bundle_index, proposal_id, share_index,
-                    sent_to_urls, nullifier, confirmed, submit_at, created_at
-                 ) VALUES ('round', ?1, 0, 1, 0, '[\"https://helper-a\"]', X'00', 0, 1, 1)",
-                [&wallet],
-            )
-            .unwrap();
-        drop(db);
-
-        let deliveries =
-            recorded_share_deliveries(&paths, Profile::Testnet, "round", 0, 1).unwrap();
-        let configured = vec![
-            "https://helper-a".to_string(),
-            "https://helper-b".to_string(),
-            "https://helper-c".to_string(),
-        ];
-        let mut accepted =
-            configured_recorded_servers(deliveries.get(&0).map(Vec::as_slice), &configured);
-        assert_eq!(accepted, HashSet::from(["https://helper-a".to_string()]));
-
-        accepted.insert("https://helper-b".to_string());
-        assert_eq!(
-            accepted.len(),
-            share_submission_target_count(configured.len())
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn manifest_failure_rolls_back_new_capability_database_state() {
+    fn manifest_failure_preserves_imported_capability_database_state() {
         let root = std::env::temp_dir().join(format!(
             "custody-voter-capability-rollback-{}",
             uuid::Uuid::new_v4()
@@ -1329,15 +999,12 @@ mod tests {
         let error = persist_capability_manifest(
             &paths,
             &crate::model::ProfileManifest::empty(Profile::Testnet),
-            &db,
-            "round",
-            false,
         )
         .unwrap_err();
 
         assert!(error.contains("replace file failed"));
-        assert_eq!(db.get_bundle_count("round").unwrap(), 0);
-        assert!(db.round("round").unwrap().is_none());
+        assert_eq!(db.get_bundle_count("round").unwrap(), 1);
+        assert!(db.round("round").unwrap().is_some());
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }

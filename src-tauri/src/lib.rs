@@ -4,6 +4,7 @@ mod model;
 mod storage;
 #[cfg(debug_assertions)]
 mod test_custodian;
+mod tracking;
 mod voter;
 
 use std::{collections::HashSet, fs, path::PathBuf};
@@ -25,6 +26,7 @@ struct AppState {
     client: Client,
     operation_lock: Mutex<()>,
     reset_token: Mutex<Option<String>>,
+    tracking: Mutex<Option<tracking::TrackingTask>>,
 }
 
 #[tauri::command]
@@ -46,7 +48,9 @@ async fn list_rounds(
         .collect::<HashSet<_>>();
     for stored in manifest.rounds.values() {
         if seen.insert(stored.snapshot.round_id.clone()) {
-            rounds.push(stored.snapshot.clone());
+            let mut snapshot = stored.snapshot.clone();
+            snapshot.authenticated = profile.is_demo();
+            rounds.push(snapshot);
         }
     }
     let mut cards = rounds
@@ -106,7 +110,11 @@ async fn get_round_workspace(
         Err(network_error) => manifest
             .rounds
             .get(&round_id)
-            .map(|stored| stored.snapshot.clone())
+            .map(|stored| {
+                let mut snapshot = stored.snapshot.clone();
+                snapshot.authenticated = profile.is_demo();
+                snapshot
+            })
             .ok_or(network_error)?,
     };
     let stored = manifest.rounds.get(&round_id);
@@ -218,9 +226,55 @@ async fn cast_votes(
     state: State<'_, AppState>,
 ) -> Result<CastVotesResult, String> {
     let _guard = state.operation_lock.lock().await;
+    if let Some(task) = state.tracking.lock().await.take() {
+        task.stop().await;
+    }
     let paths = profile_paths(&state.app_data_dir, profile)?;
     let round = chain::fetch_round(&state.client, profile, &round_id).await?;
     voter::cast_votes(app, state.client.clone(), paths, profile, round, choices).await
+}
+
+#[tauri::command]
+async fn set_tracking_round(
+    app: tauri::AppHandle,
+    profile: Profile,
+    round_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _guard = state.operation_lock.lock().await;
+    let mut task = state.tracking.lock().await;
+    let Some(round_id) = round_id else {
+        if let Some(old) = task.take() {
+            old.stop().await;
+        }
+        return Ok(());
+    };
+    let round = match chain::fetch_round(&state.client, profile, &round_id).await {
+        Ok(round) => round,
+        Err(error) => {
+            if let Some(old) = task.take() {
+                old.stop().await;
+            }
+            return Err(error);
+        }
+    };
+    let paths = profile_paths(&state.app_data_dir, profile)?;
+    let manifest = read_manifest(&paths, profile)?;
+    let stored = manifest
+        .rounds
+        .get(&round_id)
+        .ok_or("round has no saved workspace")?;
+    voter::validate_stored_round(stored, &round)?;
+    if let Some(current) = task.as_ref() {
+        if current.profile == profile && current.round_id == round_id {
+            return current.update(round);
+        }
+    }
+    if let Some(old) = task.take() {
+        old.stop().await;
+    }
+    *task = Some(tracking::TrackingTask::start(app, paths, round)?);
+    Ok(())
 }
 
 #[tauri::command]
@@ -243,6 +297,9 @@ async fn restore_backup(
 ) -> Result<RestoreResult, String> {
     let _guard = state.operation_lock.lock().await;
     let paths = profile_paths(&state.app_data_dir, profile)?;
+    if let Some(task) = state.tracking.lock().await.take() {
+        task.stop().await;
+    }
     storage::restore_backup(&paths, profile, passphrase, encrypted_bytes)
 }
 
@@ -261,6 +318,9 @@ async fn reset_all_data(
     let _guard = state.operation_lock.lock().await;
     if state.reset_token.lock().await.as_deref() != Some(confirmation_token.as_str()) {
         return Err("reset confirmation is missing or expired".to_string());
+    }
+    if let Some(task) = state.tracking.lock().await.take() {
+        task.stop().await;
     }
     let result = storage::reset_all_data(&state.app_data_dir);
     if result.is_ok() {
@@ -283,6 +343,7 @@ pub fn run() {
                 client: chain::http_client().map_err(std::io::Error::other)?,
                 operation_lock: Mutex::new(()),
                 reset_token: Mutex::new(None),
+                tracking: Mutex::new(None),
             });
             Ok(())
         });
@@ -296,6 +357,7 @@ pub fn run() {
         check_delegation_confirmations,
         generate_testnet_custody_payload,
         cast_votes,
+        set_tracking_round,
         export_backup,
         restore_backup,
         prepare_reset,
@@ -310,6 +372,7 @@ pub fn run() {
         import_capability,
         check_delegation_confirmations,
         cast_votes,
+        set_tracking_round,
         export_backup,
         restore_backup,
         prepare_reset,

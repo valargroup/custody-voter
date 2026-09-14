@@ -1,10 +1,8 @@
 use std::{collections::HashSet, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use reqwest::{header, Client, StatusCode};
-use serde::Deserialize;
+use reqwest::{header, Client};
 use serde_json::Value;
-use tokio::time::sleep;
 #[cfg(debug_assertions)]
 use zcash_voting::pir::{
     classify_pir_snapshot_height, select_pir_endpoint, PirSnapshotEndpointDiagnostic,
@@ -12,10 +10,9 @@ use zcash_voting::pir::{
 };
 use zcash_voting::{
     config::{
-        resolve_dynamic_voting_config, resolve_static_voting_config, PinnedConfigSource,
-        ResolveVotingConfigOptions, ResolvedVotingConfig,
+        resolve_dynamic_voting_config_over_mirrors, resolve_static_voting_config,
+        PinnedConfigSource, ResolveVotingConfigOptions, ResolvedVotingConfig,
     },
-    confirmation::TxEvent,
     validate_proposal_id, validate_round_params, validate_vote_options, MAX_PROPOSAL_ID,
 };
 
@@ -32,9 +29,6 @@ const MAX_ROUNDS_PER_RESPONSE: usize = 4_096;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_DESCRIPTION_BYTES: usize = 64 * 1_024;
 const MAX_OPTION_DESCRIPTION_BYTES: usize = 16 * 1_024;
-const TX_CONFIRMATION_ATTEMPTS: usize = 45;
-const TX_CONFIRMATION_DELAY: Duration = Duration::from_secs(2);
-
 pub fn http_client() -> Result<Client, String> {
     Client::builder()
         .connect_timeout(Duration::from_secs(12))
@@ -58,17 +52,14 @@ pub async fn resolve_environment(
     let static_bytes = fetch_bytes(client, &parsed.url, MAX_CONFIG_BYTES).await?;
     let resolved_static = resolve_static_voting_config(source, &static_bytes)
         .map_err(|error| format!("authenticate static voting config failed: {error}"))?;
-    let dynamic_bytes = fetch_bytes(
-        client,
-        &resolved_static.dynamic_config_url,
-        MAX_CONFIG_BYTES,
-    )
-    .await?;
-    resolve_dynamic_voting_config(
+    resolve_dynamic_voting_config_over_mirrors(
         resolved_static,
-        &dynamic_bytes,
+        Duration::from_secs(30),
         ResolveVotingConfigOptions::default(),
+        |url| async move { fetch_bytes(client, &url, MAX_CONFIG_BYTES).await },
     )
+    .await
+    .map(|(resolved, _)| resolved)
     .map_err(|error| format!("authenticate dynamic voting config failed: {error}"))
 }
 
@@ -335,23 +326,6 @@ fn parse_proposals(value: Option<&Value>) -> Result<Vec<AppProposal>, String> {
         .collect()
 }
 
-pub async fn submit_vote(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    body: &str,
-) -> Result<BroadcastResult, String> {
-    post_vote_servers(client, servers, "/shielded-vote/v1/cast-vote", body).await
-}
-
-#[cfg(debug_assertions)]
-pub async fn submit_delegation(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    body: &str,
-) -> Result<BroadcastResult, String> {
-    post_vote_servers(client, servers, "/shielded-vote/v1/delegate-vote", body).await
-}
-
 #[cfg(debug_assertions)]
 pub async fn resolve_pir_endpoint(
     client: &Client,
@@ -428,223 +402,6 @@ pub async fn resolve_pir_endpoint(
                 .join("; ");
             format!("resolve exact-height PIR endpoint failed: {error}. {summary}")
         })
-}
-
-pub async fn submit_share(client: &Client, server_url: &str, body: &str) -> Result<(), String> {
-    let url = endpoint_url(server_url, "/shielded-vote/v1/shares");
-    let response = client
-        .post(&url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.to_owned())
-        .send()
-        .await
-        .map_err(|error| format!("submit helper share to {server_url} failed: {error}"))?;
-    let status = response.status();
-    let bytes = bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await?;
-    if !status.is_success() {
-        return Err(format!(
-            "helper {server_url} rejected share with HTTP {status}: {}",
-            response_message(&bytes)
-        ));
-    }
-    Ok(())
-}
-
-pub async fn poll_validated_tx_confirmation<F>(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    tx_hash: &str,
-    mut validate: F,
-) -> Result<TxConfirmation, String>
-where
-    F: FnMut(&TxConfirmation) -> Result<(), String>,
-{
-    for attempt in 0..TX_CONFIRMATION_ATTEMPTS {
-        if let Some(confirmation) =
-            get_tx_confirmation_with(client, servers, tx_hash, &mut validate).await?
-        {
-            return Ok(confirmation);
-        }
-        if attempt + 1 < TX_CONFIRMATION_ATTEMPTS {
-            sleep(TX_CONFIRMATION_DELAY).await;
-        }
-    }
-    Err(format!(
-        "transaction {tx_hash} was not confirmed within {} seconds; retry to resume safely",
-        TX_CONFIRMATION_DELAY.as_secs() * TX_CONFIRMATION_ATTEMPTS as u64
-    ))
-}
-
-pub async fn get_tx_confirmation(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    tx_hash: &str,
-) -> Result<Option<TxConfirmation>, String> {
-    get_tx_confirmation_with(client, servers, tx_hash, &mut accept_any_confirmation).await
-}
-
-pub async fn get_validated_tx_confirmation<F>(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    tx_hash: &str,
-    mut validate: F,
-) -> Result<Option<TxConfirmation>, String>
-where
-    F: FnMut(&TxConfirmation) -> Result<(), String>,
-{
-    get_tx_confirmation_with(client, servers, tx_hash, &mut validate).await
-}
-
-async fn get_tx_confirmation_with<F>(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    tx_hash: &str,
-    validate: &mut F,
-) -> Result<Option<TxConfirmation>, String>
-where
-    F: FnMut(&TxConfirmation) -> Result<(), String>,
-{
-    validate_tx_hash(tx_hash)?;
-    let path = format!("/shielded-vote/v1/tx/{tx_hash}");
-    let mut errors = Vec::new();
-    for server in servers {
-        let url = endpoint_url(&server.url, &path);
-        match client.get(&url).send().await {
-            Ok(response) if response.status() == StatusCode::NOT_FOUND => continue,
-            Ok(response) => {
-                let status = response.status();
-                let bytes = match bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        errors.push(format!("{}: {error}", server.label));
-                        continue;
-                    }
-                };
-                if status.is_success() || status == StatusCode::UNPROCESSABLE_ENTITY {
-                    match serde_json::from_slice::<TxConfirmation>(&bytes) {
-                        Ok(confirmation) => {
-                            if confirmation.code == 0 {
-                                if let Err(error) = validate(&confirmation) {
-                                    errors.push(format!(
-                                        "{} returned an unusable transaction confirmation: {error}",
-                                        server.label
-                                    ));
-                                    continue;
-                                }
-                            }
-                            return Ok(Some(confirmation));
-                        }
-                        Err(error) => errors.push(format!(
-                            "{} returned a malformed transaction confirmation: {error}",
-                            server.label
-                        )),
-                    }
-                } else {
-                    errors.push(format!("{} returned HTTP {status}", server.label));
-                }
-            }
-            Err(error) => errors.push(format!("{}: {error}", server.label)),
-        }
-    }
-    if errors.len() == servers.len() && !servers.is_empty() {
-        return Err(format!(
-            "all vote servers failed while checking transaction: {}",
-            errors.join("; ")
-        ));
-    }
-    Ok(None)
-}
-
-fn accept_any_confirmation(_: &TxConfirmation) -> Result<(), String> {
-    Ok(())
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct BroadcastResult {
-    pub tx_hash: String,
-    pub code: u64,
-    #[serde(default)]
-    pub log: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct TxConfirmation {
-    pub code: u64,
-    #[serde(default)]
-    pub log: String,
-    #[serde(default)]
-    pub events: Vec<TxEvent>,
-}
-
-async fn post_vote_servers(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    path: &str,
-    body: &str,
-) -> Result<BroadcastResult, String> {
-    let mut errors = Vec::new();
-    for server in servers {
-        let url = endpoint_url(&server.url, path);
-        match client
-            .post(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body.to_owned())
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                let bytes = match bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        errors.push(format!("{}: {error}", server.label));
-                        continue;
-                    }
-                };
-                if status.is_success() || status == StatusCode::UNPROCESSABLE_ENTITY {
-                    let result: BroadcastResult = match serde_json::from_slice(&bytes) {
-                        Ok(result) => result,
-                        Err(error) => {
-                            errors.push(format!(
-                                "{} returned a malformed vote submission response: {error}",
-                                server.label
-                            ));
-                            continue;
-                        }
-                    };
-                    if result.code != 0 {
-                        return Err(if result.log.trim().is_empty() {
-                            format!(
-                                "vote chain rejected the transaction with code {}",
-                                result.code
-                            )
-                        } else {
-                            response_message(result.log.as_bytes())
-                        });
-                    }
-                    if let Err(error) = validate_tx_hash(&result.tx_hash) {
-                        errors.push(format!(
-                            "{} returned an invalid transaction hash: {error}",
-                            server.label
-                        ));
-                        continue;
-                    }
-                    return Ok(result);
-                }
-                if status.is_server_error() {
-                    errors.push(format!("{} returned HTTP {status}", server.label));
-                    continue;
-                }
-                return Err(format!(
-                    "{} rejected the vote with HTTP {status}: {}",
-                    server.label,
-                    response_message(&bytes)
-                ));
-            }
-            Err(error) => errors.push(format!("{}: {error}", server.label)),
-        }
-    }
-    Err(format!("all vote servers failed: {}", errors.join("; ")))
 }
 
 async fn get_from_vote_servers<T, F>(
@@ -833,14 +590,6 @@ fn parse_status(value: Option<&Value>) -> Result<String, String> {
     }
 }
 
-fn validate_tx_hash(tx_hash: &str) -> Result<(), String> {
-    if tx_hash.len() == 64 && tx_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err("vote-chain transaction hash must be exactly 64 hexadecimal characters".to_string())
-    }
-}
-
 fn status_details(status: &str) -> (String, bool) {
     let normalized = status.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -855,6 +604,7 @@ fn status_details(status: &str) -> (String, bool) {
     }
 }
 
+#[cfg(debug_assertions)]
 fn response_message(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).chars().take(500).collect()
 }
@@ -892,6 +642,41 @@ mod tests {
             },
             handle,
         )
+    }
+
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[ignore = "read-only staging service readiness check"]
+    async fn staging_config_rounds_and_helpers_are_ready() {
+        let client = http_client().unwrap();
+        let environment = resolve_environment(&client, Profile::Testnet)
+            .await
+            .unwrap();
+        let rounds = list_rounds(&client, Profile::Testnet).await.unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let active = rounds
+            .iter()
+            .filter(|r| r.is_active && r.vote_end_time > now)
+            .collect::<Vec<_>>();
+        assert!(!active.is_empty(), "no active authenticated staging rounds");
+        let fleet = crate::voter::helper_client()
+            .preflight_fleet(&crate::voter::server_urls(active[0]))
+            .await
+            .unwrap();
+        assert!(fleet.ready_server_count() > 0, "no ready staging helpers");
+        let endpoint = resolve_pir_endpoint(&client, &environment, active[0].snapshot_height)
+            .await
+            .unwrap();
+        println!(
+            "Authenticated {} active Testnet rounds; {} helpers ready; PIR at height {} via {}",
+            active.len(),
+            fleet.ready_server_count(),
+            active[0].snapshot_height,
+            endpoint
+        );
     }
 
     #[test]
@@ -941,62 +726,6 @@ mod tests {
             .contains("appears more than once"));
     }
 
-    #[test]
-    fn transaction_hashes_are_path_safe_hex() {
-        assert!(validate_tx_hash(&"AB".repeat(32)).is_ok());
-        assert!(validate_tx_hash("../../unexpected").is_err());
-        assert!(validate_tx_hash(&"a".repeat(63)).is_err());
-    }
-
-    #[tokio::test]
-    async fn confirmation_check_skips_a_malformed_server() {
-        let (malformed, malformed_handle) = response_server("malformed", "{");
-        let (healthy, healthy_handle) =
-            response_server("healthy", r#"{"code":0,"log":"confirmed","events":[]}"#);
-        let confirmation = get_tx_confirmation(
-            &http_client().unwrap(),
-            &[malformed, healthy],
-            &"ab".repeat(32),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(confirmation.code, 0);
-        assert_eq!(confirmation.log, "confirmed");
-        malformed_handle.join().unwrap();
-        healthy_handle.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn validated_confirmation_skips_an_unusable_success_response() {
-        let (unusable, unusable_handle) =
-            response_server("unusable", r#"{"code":0,"log":"","events":[]}"#);
-        let (healthy, healthy_handle) = response_server(
-            "healthy",
-            r#"{"code":0,"log":"confirmed","events":[{"type":"cast_vote","attributes":[]}]}"#,
-        );
-        let confirmation = get_validated_tx_confirmation(
-            &http_client().unwrap(),
-            &[unusable, healthy],
-            &"ab".repeat(32),
-            |confirmation| {
-                if confirmation.events.is_empty() {
-                    Err("missing expected confirmation event".to_string())
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(confirmation.log, "confirmed");
-        unusable_handle.join().unwrap();
-        healthy_handle.join().unwrap();
-    }
-
     #[tokio::test]
     async fn validated_get_skips_a_malformed_success_response() {
         let (malformed, malformed_handle) = response_server("malformed", "{");
@@ -1014,26 +743,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(response, serde_json::json!({"rounds": []}));
-        malformed_handle.join().unwrap();
-        healthy_handle.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn broadcast_skips_a_malformed_success_response() {
-        let (malformed, malformed_handle) = response_server("malformed", "{");
-        let tx_hash = "cd".repeat(32);
-        let healthy_body = format!(r#"{{"tx_hash":"{tx_hash}","code":0,"log":""}}"#);
-        let (healthy, healthy_handle) = response_server("healthy", &healthy_body);
-        let result = post_vote_servers(
-            &http_client().unwrap(),
-            &[malformed, healthy],
-            "/shielded-vote/v1/cast-vote",
-            "{}",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.tx_hash, tx_hash);
         malformed_handle.join().unwrap();
         healthy_handle.join().unwrap();
     }

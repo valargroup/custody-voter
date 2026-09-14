@@ -55,6 +55,7 @@ export interface RoundProgress {
   confirmedVoteCount: number;
   requiredShareCount: number;
   submittedShareCount: number;
+  confirmedShareCount: number;
 }
 
 export interface RoundCard extends RoundSnapshot {
@@ -121,6 +122,10 @@ export interface VoteTransactionResult {
 }
 
 export interface CastVotesResult {
+  outcome: "complete" | "tracking" | "pending" | "blocked";
+  message: string;
+  sharesDelivered: number;
+  sharesConfirmed: number;
   demo: boolean;
   proofCount: number;
   transactions: VoteTransactionResult[];
