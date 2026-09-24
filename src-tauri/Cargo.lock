@@ -2895,6 +2895,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "imt-tree"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f92c99eb90cebfcd9697072e01c55eb7313297405dd59890556ba808ecea03c8"
+dependencies = [
+ "anyhow",
+ "hex",
+ "rayon",
+ "voting-crypto-deps",
+]
+
+[[package]]
 name = "incrementalmerkletree"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4174,15 +4186,15 @@ dependencies = [
 
 [[package]]
 name = "pir-client"
-version = "0.4.0-rc.7"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf6547ec35c8d4af154bc73d60fe2773be50f7c089e79414983d721d0dbc13db"
+checksum = "350efadb12ec2d11c8966cd376d9677c9e0038e3bb4aa2acfc69a8edc25700c9"
 dependencies = [
  "anyhow",
  "ff",
  "futures",
  "hex",
- "imt-tree",
+ "imt-tree 0.2.1",
  "log",
  "pasta_curves",
  "pir-types",
@@ -4193,13 +4205,13 @@ dependencies = [
 
 [[package]]
 name = "pir-types"
-version = "0.3.0-rc.6"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24f3dd9f975f28591b07af57cca89804650c38fa66051cf12f34d664f7ea2ac6"
+checksum = "635f27cfabeca929f821a0f1c934a15f27fd2922a61c487ecf1daa43b20dfd3e"
 dependencies = [
  "anyhow",
  "ff",
- "imt-tree",
+ "imt-tree 0.2.1",
  "pasta_curves",
  "serde",
 ]
@@ -6835,52 +6847,56 @@ dependencies = [
 
 [[package]]
 name = "vote-commitment-tree"
-version = "0.5.0-rc.1"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fac7b20bee99168197ecdb760181d6d731ec7fb2428ff380a4772f2f1abfae9"
+checksum = "96c3cd8d61342d6f6643710abdb4f43be542af65e56680836d216b5fe4da6bb9"
 dependencies = [
  "anyhow",
- "ff",
- "halo2_gadgets",
- "imt-tree",
+ "imt-tree 0.5.3",
  "incrementalmerkletree",
  "lazy_static",
  "libc",
- "pasta_curves",
  "shardtree",
+ "voting-crypto-deps",
 ]
 
 [[package]]
 name = "vote-commitment-tree-client"
-version = "0.7.0-rc.1"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32d3a7fd4c1a40672a2f13c625999b8fefeb44d517230b4db1d4947c473d4e4a"
+checksum = "24d6aea25b42da138799b32a8fa03047249ddf669eb3203aa3b6fb324038b727"
 dependencies = [
  "base64 0.22.1",
- "ff",
  "hex",
- "pasta_curves",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "vote-commitment-tree",
+ "voting-crypto-deps",
 ]
 
 [[package]]
 name = "voting-circuits"
-version = "0.10.0-rc.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "416ad7678c8b74d03267410a49f509bb78346b5cc8d5aef04c18bd5184a193cb"
+checksum = "85340971c7e98468ed71856c65b82ae461fb968f7d9c788566f7ea8b799e260e"
 dependencies = [
  "blake2b_simd",
- "ff",
- "group",
- "halo2_gadgets",
- "halo2_poseidon",
- "halo2_proofs",
  "incrementalmerkletree",
  "itertools",
  "lazy_static",
+ "voting-crypto-deps",
+]
+
+[[package]]
+name = "voting-crypto-deps"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7093c43ce71cde30f4d9c1154fa6f0b69c6866a4efb9cb582055a81dcf438a6e"
+dependencies = [
+ "halo2_gadgets",
+ "halo2_poseidon",
+ "halo2_proofs",
  "orchard",
  "pasta_curves",
  "rand 0.8.7",
@@ -8017,9 +8033,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_voting"
-version = "3.0.0-rc.3"
+version = "4.0.0-rc.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efbea3bf21e9185e6e49ec7632a1f2a4ada26542197a6e7cf9d35114eb999a70"
+checksum = "474f4488acfdee954aa67db719b0dd4d7ffd6cd6b2e8cc49c33cebf22c54f898"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8036,7 +8052,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "imt-tree",
+ "imt-tree 0.5.3",
  "incrementalmerkletree",
  "nonempty",
  "orchard",
