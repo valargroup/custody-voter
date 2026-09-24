@@ -13,7 +13,7 @@ When asked to build the application, produce a production-optimized release buil
 Prerequisites:
 
 - macOS with Xcode Command Line Tools
-- the current stable Rust toolchain
+- Rust 1.91 or newer
 - Node.js 20.19 or newer
 
 From the repository root:
@@ -103,7 +103,16 @@ The full proof smoke test is ignored during ordinary CI because it is CPU intens
 
 ```sh
 cd src-tauri
-cargo test demo::tests::demo_generates_and_confirms_a_real_vote_proof -- --ignored --exact
+cargo test demo::tests::demo_generates_and_confirms_sequential_vote_proofs -- --ignored --exact
+```
+
+The proof smoke test casts sequential votes for proposal IDs 1 and 50 after
+importing a custody capability. To check current round discovery and authentication
+on both networks without broadcasting:
+
+```sh
+cd src-tauri
+cargo test chain::tests::live_networks_load_authenticated_rounds -- --ignored --exact --nocapture
 ```
 
 The live Testnet wallet-recovery smoke test is also opt-in:
@@ -145,6 +154,7 @@ xcrun stapler validate Custody-Voter-macos.dmg
 ## Current scope
 
 - The first release is a desktop app. There is no hosted web version because a browser would put voting-secret storage and native proof dependencies behind a weaker boundary.
+- Voting supports proposal IDs 1–50 using the LRZ maintenance SDK and its matching circuits. Custodians must generate delegations with the same 50-proposal circuit generation. The V1 target and capability JSON formats are unchanged; this does not make old 15-proposal delegation proofs or commitments compatible. Preserve existing backups and hotkeys when upgrading.
 - Mainnet and Testnet use the currently pinned Valar voting configuration revisions. Updating those trust anchors is an intentional source change and release event.
 - GitHub release DMGs are signed and notarized for direct macOS distribution. An automatic update channel remains future deployment work.
 

@@ -394,7 +394,7 @@ mod tests {
             &round.round_id,
             0,
             &[DraftVote {
-                proposal_id: 2,
+                proposal_id: 50,
                 choice: 0,
                 num_options: 2,
                 vc_tree_position: 0,

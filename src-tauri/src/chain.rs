@@ -942,6 +942,75 @@ mod tests {
     }
 
     #[test]
+    fn proposal_parser_accepts_current_rounds_and_circuit_boundary() {
+        for count in [37, 50] {
+            let proposals = serde_json::json!((1..=count)
+                .map(|id| serde_json::json!({
+                    "id": id,
+                    "options": [{"label": "Yes"}, {"index": 1, "label": "No"}]
+                }))
+                .collect::<Vec<_>>());
+            let parsed = parse_proposals(Some(&proposals)).unwrap();
+            assert_eq!(parsed.len(), count as usize);
+            assert_eq!(parsed.last().unwrap().id, count);
+        }
+        for id in [0, 51] {
+            let proposals = serde_json::json!([
+                {"id": id, "options": [{"label": "Yes"}, {"index": 1, "label": "No"}]}
+            ]);
+            assert!(parse_proposals(Some(&proposals)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "reads authenticated rounds from live Mainnet and Testnet services"]
+    async fn live_networks_load_authenticated_rounds() {
+        let client = http_client().unwrap();
+        for profile in [Profile::Testnet, Profile::Mainnet] {
+            let environment = resolve_environment(&client, profile).await.unwrap();
+            // Check each configured Valar replica independently so failover cannot
+            // hide an incompatible response. Other operators may be unavailable.
+            let servers = vote_server_views(&environment);
+            for server in servers
+                .iter()
+                .filter(|server| server.url.contains(".valargroup.org"))
+            {
+                let bytes = fetch_bytes(
+                    &client,
+                    &endpoint_url(&server.url, "/shielded-vote/v1/rounds"),
+                    MAX_CHAIN_RESPONSE_BYTES,
+                )
+                .await
+                .unwrap();
+                let rounds = parse_round_list_response(profile, &environment, &bytes).unwrap();
+                assert!(
+                    !rounds.is_empty(),
+                    "{} returned no authenticated rounds",
+                    server.url
+                );
+                assert!(rounds.iter().all(|round| round.authenticated));
+                println!(
+                    "{}: {} authenticated rounds, largest roster {}",
+                    server.url,
+                    rounds.len(),
+                    rounds
+                        .iter()
+                        .map(|round| round.proposals.len())
+                        .max()
+                        .unwrap()
+                );
+            }
+            let rounds = list_rounds(&client, profile).await.unwrap();
+            assert!(!rounds.is_empty());
+            let round = fetch_round(&client, profile, &rounds[0].round_id)
+                .await
+                .unwrap();
+            assert_eq!(round.params, rounds[0].params);
+            assert_eq!(round.proposals, rounds[0].proposals);
+        }
+    }
+
+    #[test]
     fn transaction_hashes_are_path_safe_hex() {
         assert!(validate_tx_hash(&"AB".repeat(32)).is_ok());
         assert!(validate_tx_hash("../../unexpected").is_err());
