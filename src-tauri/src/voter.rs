@@ -39,6 +39,11 @@ use crate::{
     storage::{load_hotkey, open_db, read_manifest, store_hotkey, write_manifest, ProfilePaths},
 };
 
+/// Longest random delay before a helper reveals an initial vote share. This
+/// matches `SHARE_SUBMIT_AT_MAX_DELAY_SECONDS` in `zcash_voting` 5.2, which
+/// Vizor uses; the pinned 4.0 SDK has no cap.
+const SHARE_SUBMIT_AT_MAX_DELAY_SECONDS: u64 = 100 * 60 * 60;
+
 pub fn target_json(
     hotkey: &VotingHotkey,
     chain_id: &str,
@@ -924,9 +929,13 @@ async fn submit_missing_shares(
         commitment.proposal_id,
     )?;
     let now = unix_seconds()?;
-    let buffer = round
-        .ceremony_start_time
-        .and_then(|start| last_moment_buffer_seconds(start, round.vote_end_time));
+    let buffer = share_schedule_buffer(
+        round
+            .ceremony_start_time
+            .and_then(|start| last_moment_buffer_seconds(start, round.vote_end_time)),
+        now,
+        round.vote_end_time,
+    );
     let required = share_submission_random_bytes_required(
         commitment.share_payloads.len(),
         server_urls.len(),
@@ -1169,9 +1178,75 @@ fn unix_seconds() -> Result<u64, String> {
         .map_err(|error| format!("system clock is before Unix epoch: {error}"))
 }
 
+/// Returns the last-moment buffer to plan initial helper shares with.
+///
+/// The SDK samples each share's reveal time uniformly in
+/// `[now, vote_end - buffer)`. Widening the buffer caps that window at
+/// `SHARE_SUBMIT_AT_MAX_DELAY_SECONDS`. A missing or zero buffer, which means
+/// immediate submission, is returned unchanged.
+fn share_schedule_buffer(buffer: Option<u64>, now: u64, vote_end_time: u64) -> Option<u64> {
+    buffer.map(|buffer| {
+        if buffer == 0 {
+            return 0;
+        }
+        buffer.max(
+            vote_end_time
+                .saturating_sub(now)
+                .saturating_sub(SHARE_SUBMIT_AT_MAX_DELAY_SECONDS),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_voting::share_policy::scheduled_share_submit_at_from_random_unit;
+
+    const HOUR: u64 = 60 * 60;
+
+    /// Returns the latest reveal time the SDK can sample for a share planned
+    /// with `buffer` at `now`.
+    fn latest_submit_at(now: u64, vote_end_time: u64, buffer: Option<u64>) -> u64 {
+        scheduled_share_submit_at_from_random_unit(
+            now,
+            vote_end_time,
+            share_schedule_buffer(buffer, now, vote_end_time),
+            false,
+            0.999_999_999,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn share_delay_is_capped_in_long_rounds() {
+        let now = 1_000_000;
+        let vote_end_time = now + 14 * 24 * HOUR;
+
+        let latest = latest_submit_at(now, vote_end_time, Some(6 * HOUR));
+
+        assert!(latest > now + 99 * HOUR);
+        assert!(latest < now + SHARE_SUBMIT_AT_MAX_DELAY_SECONDS);
+    }
+
+    #[test]
+    fn share_delay_keeps_sdk_window_when_shorter_than_cap() {
+        let now = 1_000_000;
+        let vote_end_time = now + 48 * HOUR;
+        let buffer = Some(6 * HOUR);
+
+        assert_eq!(share_schedule_buffer(buffer, now, vote_end_time), buffer);
+        assert!(latest_submit_at(now, vote_end_time, buffer) > now + 41 * HOUR);
+    }
+
+    #[test]
+    fn share_delay_keeps_immediate_submission() {
+        let now = 1_000_000;
+        let vote_end_time = now + 14 * 24 * HOUR;
+
+        assert_eq!(share_schedule_buffer(None, now, vote_end_time), None);
+        assert_eq!(share_schedule_buffer(Some(0), now, vote_end_time), Some(0));
+        assert_eq!(latest_submit_at(now, vote_end_time, Some(0)), 0);
+    }
 
     #[test]
     fn stored_round_allows_lifecycle_changes_but_rejects_proposal_changes() {
