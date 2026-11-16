@@ -4,7 +4,7 @@ version = "1.0.4"
 description = "Customer application for custody-delegated Zcash voting"
 authors = ["Valar"]
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/valargroup/custody-voter"
 publish = false
@@ -44,10 +44,10 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.14", features = ["channel", "tls-ring", "tls-webpki-roots"] }
 uuid = { version = "1", features = ["v4"] }
-vote-commitment-tree = "=0.6.1"
-vote-commitment-tree-client = { version = "=0.8.1", features = ["http"] }
-zcash_protocol = "0.10.4"
-zcash_voting = "=5.0.0"
+vote-commitment-tree = "=0.9.0"
+vote-commitment-tree-client = { version = "=0.11.0", features = ["http"] }
+zcash_protocol = { package = "zakura-protocol", version = "=5.4.0" }
+zcash_voting = "=5.4.0"
 zeroize = "1"
 zip32 = "0.2"
 

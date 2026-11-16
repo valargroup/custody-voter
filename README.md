@@ -13,7 +13,7 @@ When asked to build the application, produce a production-optimized release buil
 Prerequisites:
 
 - macOS with Xcode Command Line Tools
-- Rust 1.91 or newer (current stable recommended)
+- Rust 1.97 or newer (current stable recommended)
 - Node.js 20.19 or newer
 
 From the repository root:
@@ -44,7 +44,7 @@ npm run tauri -- build --debug --bundles app
 open "src-tauri/target/debug/bundle/macos/Zcash Custody Voter.app"
 ```
 
-The app uses `zcash_voting` 5.0.0 with the Zakura backend. Existing schema-13 and newer voting databases migrate in place, with a private `.before-v5` SQLite snapshot created before migration. Hotkeys and profile identifiers are preserved. Unsupported database versions are rejected without resetting them. Historical rounds that cannot be freshly authenticated remain viewable but cannot be used for new voting operations.
+The app uses `zcash_voting` 5.4.0 with the Zakura backend. Existing schema-13 and newer voting databases migrate in place, with a private `.before-v5` SQLite snapshot created before migration. Hotkeys and profile identifiers are preserved. Unsupported database versions are rejected without resetting them. Historical rounds that cannot be freshly authenticated remain viewable but cannot be used for new voting operations.
 
 Keep the selected workspace open until both votes and helper shares are confirmed. Reopening it resumes helper tracking; retry the vote action to reconcile an interrupted chain submission.
 

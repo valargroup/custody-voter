@@ -7,15 +7,13 @@ use std::{
     time::Duration,
 };
 use zcash_voting::backend::orchard;
-use zcash_voting::backend::pasta_curves;
 use zcash_voting::backend::zcash_client_backend;
 use zcash_voting::backend::zcash_client_sqlite;
 use zcash_voting::backend::zcash_keys;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bip0039::{English, Mnemonic};
-use ff::PrimeField;
-use pasta_curves::pallas;
+use orchard::primitives::redpallas::SpendAuthRandomizer;
 use prost::Message;
 use rand10::{rngs::StdRng, SeedableRng};
 // Wallet migrations require Clone. Cloning creates an independent CSPRNG;
@@ -977,7 +975,7 @@ fn sign_delegation_request(
     let usk = UnifiedSpendingKey::from_seed(&request.network, seed, account)
         .map_err(|error| format!("derive test wallet spending key failed: {error}"))?;
     let ask = orchard::keys::SpendAuthorizingKey::from(usk.orchard());
-    let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(request.alpha))
+    let alpha = Option::<SpendAuthRandomizer>::from(SpendAuthRandomizer::from_bytes(request.alpha))
         .ok_or_else(|| "delegation randomizer is not a canonical Pallas scalar".to_string())?;
     let randomized = ask.randomize(&alpha);
     let signature = randomized.sign(wallet_rng(), &request.sighash);
@@ -1665,6 +1663,81 @@ fn emit_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff::{Field, PrimeField};
+    use zcash_voting::backend::pasta_curves::pallas;
+
+    fn delegation_signing_fixture(alpha: [u8; 32]) -> (SecretVec<u8>, DelegationSigningRequest) {
+        let seed = SecretVec::new(vec![0x42; 32]);
+        let request = DelegationSigningRequest {
+            account_index: ZIP32_ACCOUNT_INDEX,
+            network: Network::Testnet,
+            seed_fingerprint: SeedFingerprint::from_seed(seed.expose_secret())
+                .unwrap()
+                .to_bytes(),
+            sighash: [0x24; 32],
+            alpha,
+        };
+        (seed, request)
+    }
+
+    #[test]
+    fn delegation_signatures_bind_the_requested_randomizer_and_message() {
+        for scalar in [
+            pallas::Scalar::ZERO,
+            pallas::Scalar::ONE,
+            -pallas::Scalar::ONE,
+        ] {
+            let (seed, request) = delegation_signing_fixture(scalar.to_repr());
+            let (signature, sighash) = sign_delegation_request(&seed, request).unwrap();
+            assert_eq!(sighash, request.sighash);
+            let account = Zip32AccountId::try_from(ZIP32_ACCOUNT_INDEX).unwrap();
+            let key =
+                UnifiedSpendingKey::from_seed(&request.network, seed.expose_secret(), account)
+                    .unwrap();
+            let ask = orchard::keys::SpendAuthorizingKey::from(key.orchard());
+            let ak = orchard::keys::SpendValidatingKey::from(&ask);
+            let randomizer = SpendAuthRandomizer::from_bytes(request.alpha).unwrap();
+            let verification_key = ak.randomize(&randomizer);
+            let signature = orchard::primitives::redpallas::Signature::from(signature);
+            verification_key.verify(&sighash, &signature).unwrap();
+            assert!(verification_key.verify(&[0x25; 32], &signature).is_err());
+            let other_randomizer =
+                SpendAuthRandomizer::from_bytes((scalar + pallas::Scalar::ONE).to_repr()).unwrap();
+            assert!(ak
+                .randomize(&other_randomizer)
+                .verify(&sighash, &signature)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn delegation_signing_rejects_noncanonical_randomizers_and_wrong_wallets() {
+        let mut modulus = (-pallas::Scalar::ONE).to_repr();
+        for byte in &mut modulus {
+            let (sum, carry) = byte.overflowing_add(1);
+            *byte = sum;
+            if !carry {
+                break;
+            }
+        }
+        for alpha in [modulus, [0xff; 32]] {
+            let (seed, request) = delegation_signing_fixture(alpha);
+            assert!(sign_delegation_request(&seed, request)
+                .unwrap_err()
+                .contains("not a canonical Pallas scalar"));
+        }
+        let (seed, request) = delegation_signing_fixture([0; 32]);
+        let mut wrong_wallet = request;
+        wrong_wallet.seed_fingerprint[0] ^= 1;
+        assert!(sign_delegation_request(&seed, wrong_wallet)
+            .unwrap_err()
+            .contains("fingerprint does not match"));
+        let mut wrong_account = request;
+        wrong_account.account_index += 1;
+        assert!(sign_delegation_request(&seed, wrong_account)
+            .unwrap_err()
+            .contains("expected account 0"));
+    }
 
     #[test]
     fn raw_delegation_transaction_matches_vote_sdk_wire_shape() {
