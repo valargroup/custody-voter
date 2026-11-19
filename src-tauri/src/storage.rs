@@ -11,9 +11,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use keyring::Entry;
 use rusqlite::{named_params, OptionalExtension};
 use uuid::Uuid;
-use zcash_voting::{
-    round::VotingDb, share_policy::share_submission_target_count, VotingHotkey, BALLOT_DIVISOR,
-};
+use zcash_voting::{round::VotingDb, VotingHotkey, BALLOT_DIVISOR};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::model::{
@@ -28,6 +26,16 @@ const MIN_BACKUP_PASSPHRASE_CHARS: usize = 12;
 const MAX_BACKUP_PASSPHRASE_CHARS: usize = 1_024;
 const MAX_BACKUP_DATABASE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_ENCRYPTED_BACKUP_BYTES: usize = 192 * 1024 * 1024;
+
+/// SQL condition for a vote row that still records a vote, because it holds a
+/// signed commitment or reached the chain.
+///
+/// Changing a choice before its vote was sent clears the old commitment but
+/// keeps the row and its old choice. That row records nothing, so it must not
+/// lock a selection, count as a vote, or be resumed.
+pub const RECORDED_VOTE: &str = "(commitment_bundle_json IS NOT NULL \
+    OR tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL)";
+
 type CapturedHotkeys = BTreeMap<String, Option<Zeroizing<Vec<u8>>>>;
 
 #[derive(Clone, Debug)]
@@ -283,31 +291,32 @@ pub fn round_progress(
     }
     let db = open_db(paths, profile)?;
     let wallet = db.wallet_id();
-    let conn = db.conn();
-    let bundle_stats: Option<(i64, i64, i64)> = conn
-        .query_row(
-            "SELECT COUNT(*),
-                    COALESCE(SUM(CASE WHEN van_leaf_position IS NOT NULL THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(total_note_value), 0)
-             FROM bundles
-             WHERE round_id = :round_id AND wallet_id = :wallet_id",
-            named_params! { ":round_id": round_id, ":wallet_id": wallet },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(|error| format!("load delegation progress failed: {error}"))?;
-    let vote_stats: (i64, i64, i64) = conn
-        .query_row(
-            "SELECT COUNT(*),
-                    COALESCE(SUM(CASE WHEN tx_hash IS NOT NULL THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN vc_tree_position IS NOT NULL THEN 1 ELSE 0 END), 0)
-             FROM votes
-             WHERE round_id = :round_id AND wallet_id = :wallet_id",
-            named_params! { ":round_id": round_id, ":wallet_id": wallet },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|error| format!("load vote progress failed: {error}"))?;
-    let required_share_count = {
+    let (bundle_stats, vote_stats, required_share_count) = {
+        let conn = db.conn();
+        let bundle_stats: Option<(i64, i64, i64)> = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN van_leaf_position IS NOT NULL THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(total_note_value), 0)
+                 FROM bundles
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id",
+                named_params! { ":round_id": round_id, ":wallet_id": wallet },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("load delegation progress failed: {error}"))?;
+        let vote_stats: (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(CASE WHEN vc_tree_position IS NOT NULL THEN 1 ELSE 0 END), 0)
+                     FROM votes
+                     WHERE round_id = :round_id AND wallet_id = :wallet_id AND {RECORDED_VOTE}"
+                ),
+                named_params! { ":round_id": round_id, ":wallet_id": wallet },
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("load vote progress failed: {error}"))?;
         let mut statement = conn
             .prepare(
                 "SELECT commitment_bundle_json
@@ -322,58 +331,29 @@ pub fn round_progress(
                 |row| row.get::<_, String>(0),
             )
             .map_err(|error| format!("query required helper shares failed: {error}"))?;
-        let mut total = 0u32;
+        let mut required_share_count = 0u32;
         for row in rows {
             let commitment_json =
                 row.map_err(|error| format!("decode vote commitment state failed: {error}"))?;
-            total = total
-                .checked_add(encrypted_share_count(&commitment_json)?)
+            required_share_count = required_share_count
+                .checked_add(delivered_share_count(&commitment_json)?)
                 .ok_or_else(|| {
                     "required helper share count is outside the supported range".to_string()
                 })?;
         }
-        total
+        (bundle_stats, vote_stats, required_share_count)
     };
-    let helper_target_count = share_submission_target_count(helper_servers.len());
-    let submitted_share_count = if helper_target_count == 0 {
-        0
-    } else {
-        let mut statement = conn
-            .prepare(
-                "SELECT sent_to_urls
-                 FROM share_delegations
-                 WHERE round_id = :round_id AND wallet_id = :wallet_id",
-            )
-            .map_err(|error| format!("prepare submitted helper share query failed: {error}"))?;
-        let rows = statement
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet },
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("query submitted helper shares failed: {error}"))?;
-        let mut complete = 0u32;
-        for row in rows {
-            let sent_to_urls =
-                row.map_err(|error| format!("decode helper share delivery failed: {error}"))?;
-            let sent_to_urls: Vec<String> = serde_json::from_str(&sent_to_urls)
-                .map_err(|error| format!("decode helper share server list failed: {error}"))?;
-            let accepted_count = sent_to_urls
-                .into_iter()
-                .filter(|url| {
-                    helper_servers
-                        .iter()
-                        .any(|server| server.url.as_str() == url.as_str())
-                })
-                .collect::<BTreeSet<_>>()
-                .len();
-            if accepted_count >= helper_target_count {
-                complete = complete.checked_add(1).ok_or_else(|| {
-                    "submitted helper share count is outside the supported range".to_string()
-                })?;
-            }
-        }
-        complete
-    };
+    let helper_urls = crate::voter::canonical_helper_urls(
+        &helper_servers
+            .iter()
+            .map(|server| server.url.clone())
+            .collect::<Vec<_>>(),
+    );
+    let submitted_share_count = zcash_voting::share::list(&db, round_id)
+        .map_err(|error| format!("load helper share delivery failed: {error}"))?
+        .iter()
+        .filter(|share| crate::voter::share_delivered(share, &helper_urls))
+        .count();
     let (bundle_count, confirmed_bundle_count, delegated_value) = bundle_stats.unwrap_or_default();
     Ok(RoundProgress {
         target_ready,
@@ -382,21 +362,38 @@ pub fn round_progress(
         confirmed_bundle_count: to_u32(confirmed_bundle_count, "confirmed bundle count")?,
         delegated_ballots: to_u64(delegated_value, "delegated value")? / BALLOT_DIVISOR,
         vote_count: to_u32(vote_stats.0, "vote count")?,
-        submitted_vote_count: to_u32(vote_stats.1, "submitted vote count")?,
-        confirmed_vote_count: to_u32(vote_stats.2, "confirmed vote count")?,
+        // The SDK's chain lifecycle owns the submission of every committed
+        // vote, so each one is work the app can resume.
+        submitted_vote_count: to_u32(vote_stats.0, "vote count")?,
+        confirmed_vote_count: to_u32(vote_stats.1, "confirmed vote count")?,
         required_share_count,
-        submitted_share_count,
+        submitted_share_count: u32::try_from(submitted_share_count).map_err(|_| {
+            "submitted helper share count is outside the supported range".to_string()
+        })?,
     })
 }
 
-fn encrypted_share_count(commitment_json: &str) -> Result<u32, String> {
+/// Counts the helper shares a stored vote commitment delivers.
+///
+/// A last-moment vote carries every encrypted share but delivers only the
+/// first one, so it owes a single helper share.
+fn delivered_share_count(commitment_json: &str) -> Result<u32, String> {
     let commitment: serde_json::Value = serde_json::from_str(commitment_json)
         .map_err(|error| format!("decode stored vote commitment failed: {error}"))?;
     let shares = commitment
         .get("encrypted_shares")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "stored vote commitment has no encrypted share list".to_string())?;
-    u32::try_from(shares.len())
+    let single_share = commitment
+        .get("single_share")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let count = if single_share {
+        shares.len().min(1)
+    } else {
+        shares.len()
+    };
+    u32::try_from(count)
         .map_err(|_| "required helper share count is outside the supported range".to_string())
 }
 
@@ -412,12 +409,12 @@ pub fn vote_records(
     let wallet = db.wallet_id();
     let conn = db.conn();
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT bundle_index, proposal_id, choice, tx_hash, vc_tree_position
              FROM votes
-             WHERE round_id = :round_id AND wallet_id = :wallet_id
-             ORDER BY bundle_index, proposal_id",
-        )
+             WHERE round_id = :round_id AND wallet_id = :wallet_id AND {RECORDED_VOTE}
+             ORDER BY bundle_index, proposal_id"
+        ))
         .map_err(|error| format!("prepare vote recovery query failed: {error}"))?;
     let rows = statement
         .query_map(
@@ -458,13 +455,7 @@ pub fn export_backup(
     let passphrase = Zeroizing::new(passphrase);
     let manifest = read_manifest(paths, profile)?;
 
-    let db = open_db(paths, profile)?;
-    db.conn()
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .map_err(|error| format!("checkpoint voting database failed: {error}"))?;
-    drop(db);
-    let database = fs::read(&paths.database)
-        .map_err(|error| format!("read voting database for backup failed: {error}"))?;
+    let database = snapshot_database(paths, profile)?;
     validate_backup_database_size(database.len())?;
 
     let mut hotkeys = Vec::with_capacity(manifest.rounds.len());
@@ -498,6 +489,26 @@ pub fn export_backup(
         ),
         encrypted_bytes,
     })
+}
+
+/// Copies the profile's voting database as one consistent snapshot.
+///
+/// `VACUUM INTO` reads a single transaction, so background tracking can keep
+/// writing while the backup is taken. A checkpoint followed by a file copy
+/// could capture pages from two database states.
+fn snapshot_database(paths: &ProfilePaths, profile: Profile) -> Result<Vec<u8>, String> {
+    let snapshot = paths
+        .directory
+        .join(format!("voting.sqlite.export-{}", Uuid::new_v4()));
+    let _snapshot_cleanup = TemporaryDatabase(snapshot.clone());
+    let target = snapshot
+        .to_str()
+        .ok_or_else(|| "backup snapshot path is not valid UTF-8".to_string())?;
+    open_db(paths, profile)?
+        .conn()
+        .execute("VACUUM INTO ?1", [target])
+        .map_err(|error| format!("snapshot voting database failed: {error}"))?;
+    fs::read(&snapshot).map_err(|error| format!("read voting database snapshot failed: {error}"))
 }
 
 pub fn restore_backup(
@@ -1037,6 +1048,63 @@ mod tests {
     }
 
     #[test]
+    fn retired_vote_rows_neither_lock_nor_count() {
+        let database =
+            std::env::temp_dir().join(format!("custody-voter-retired-{}.sqlite", Uuid::new_v4()));
+        let _database = TemporaryDatabase(database.clone());
+        let paths = ProfilePaths {
+            directory: std::env::temp_dir(),
+            manifest: database.with_extension("json"),
+            database,
+        };
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        let wallet = db.wallet_id().to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO rounds (
+                    round_id, wallet_id, network, snapshot_height, ea_pk, nc_root,
+                    nullifier_imt_root, created_at
+                 ) VALUES ('round', ?1, 'testnet', 1, X'00', X'00', X'00', 1)",
+                [&wallet],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (
+                    round_id, wallet_id, bundle_index, total_note_value, van_leaf_position
+                 ) VALUES ('round', ?1, 0, 0, 7)",
+                [&wallet],
+            )
+            .unwrap();
+        // A changed choice retired proposal 1's unsent vote, leaving its row
+        // and old choice behind. Proposal 2's vote is signed and recoverable.
+        db.conn()
+            .execute(
+                "INSERT INTO votes (
+                    round_id, wallet_id, bundle_index, proposal_id, choice, created_at,
+                    commitment_bundle_json
+                 ) VALUES
+                    ('round', ?1, 0, 1, 0, 1, NULL),
+                    ('round', ?1, 0, 2, 1, 1, '{\"single_share\":true,\"encrypted_shares\":[{}]}')",
+                [&wallet],
+            )
+            .unwrap();
+        drop(db);
+
+        let votes = vote_records(&paths, Profile::Testnet, "round").unwrap();
+        let progress = round_progress(&paths, Profile::Testnet, "round", true, true, &[]).unwrap();
+
+        assert_eq!(
+            votes
+                .iter()
+                .map(|vote| vote.proposal_id)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(progress.submitted_vote_count, 1);
+    }
+
+    #[test]
     fn round_progress_distinguishes_confirmed_votes_from_complete_share_delivery() {
         let database =
             std::env::temp_dir().join(format!("custody-voter-progress-{}.sqlite", Uuid::new_v4()));
@@ -1066,8 +1134,8 @@ mod tests {
             )
             .unwrap();
         for (proposal_id, commitment_json) in [
-            (1, r#"{"encrypted_shares":[{},{}]}"#),
-            (2, r#"{"encrypted_shares":[{},{},{}]}"#),
+            (1, r#"{"single_share":false,"encrypted_shares":[{},{}]}"#),
+            (2, r#"{"single_share":true,"encrypted_shares":[{},{},{}]}"#),
         ] {
             db.conn()
                 .execute(
@@ -1079,25 +1147,36 @@ mod tests {
                 )
                 .unwrap();
         }
-        for (proposal_id, share_index, sent_to_urls) in [
-            (1, 0, r#"["helper-a","helper-b"]"#),
-            (1, 1, r#"["helper-a"]"#),
-            (2, 0, r#"["helper-a","helper-b"]"#),
-            (2, 1, r#"["helper-a","helper-b","helper-b"]"#),
+        for (proposal_id, share_index, sent_to_urls, ambiguous_urls) in [
+            (1, 0, r#"["https://a.example","https://b.example"]"#, "[]"),
+            (1, 1, "[]", r#"["https://c.example"]"#),
+            (2, 0, r#"["https://removed.example"]"#, "[]"),
         ] {
             db.conn()
                 .execute(
                     "INSERT INTO share_delegations (
                         round_id, wallet_id, bundle_index, proposal_id, share_index,
-                        sent_to_urls, nullifier, confirmed, submit_at, created_at
-                     ) VALUES ('round', ?1, 0, ?2, ?3, ?4, X'00', 1, 1, 1)",
-                    rusqlite::params![wallet, proposal_id, share_index, sent_to_urls],
+                        sent_to_urls, ambiguous_urls, nullifier, confirmed, submit_at,
+                        created_at
+                     ) VALUES ('round', ?1, 0, ?2, ?3, ?4, ?5, zeroblob(32), 0, 1, 1)",
+                    rusqlite::params![
+                        wallet,
+                        proposal_id,
+                        share_index,
+                        sent_to_urls,
+                        ambiguous_urls
+                    ],
                 )
                 .unwrap();
         }
         drop(db);
 
-        let helper_servers = ["helper-a", "helper-b", "helper-c"].map(|url| ServiceEndpointView {
+        let helper_servers = [
+            "https://a.example",
+            "https://b.example/",
+            "https://c.example",
+        ]
+        .map(|url| ServiceEndpointView {
             url: url.to_string(),
             label: url.to_string(),
         });
@@ -1124,8 +1203,42 @@ mod tests {
         assert!(progress.capability_imported);
         assert_eq!(progress.vote_count, 2);
         assert_eq!(progress.confirmed_vote_count, 2);
-        assert_eq!(progress.required_share_count, 5);
-        assert_eq!(progress.submitted_share_count, 3);
+        assert_eq!(progress.required_share_count, 3);
+        // An outcome-unknown attempt and a helper outside the fleet don't count.
+        assert_eq!(progress.submitted_share_count, 1);
+    }
+
+    #[test]
+    fn backup_snapshot_reopens_with_its_rows() {
+        let root = std::env::temp_dir().join(format!("custody-voter-snapshot-{}", Uuid::new_v4()));
+        let paths = profile_paths(&root, Profile::Testnet).unwrap();
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        let wallet = db.wallet_id().to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO rounds (
+                    round_id, wallet_id, network, snapshot_height, ea_pk, nc_root,
+                    nullifier_imt_root, created_at
+                 ) VALUES ('round', ?1, 'testnet', 1, X'00', X'00', X'00', 1)",
+                [&wallet],
+            )
+            .unwrap();
+
+        // The source stays open, as it would for a running tracker.
+        let bytes = snapshot_database(&paths, Profile::Testnet).unwrap();
+        drop(db);
+        let restored = root.join("restored.sqlite");
+        fs::write(&restored, bytes).unwrap();
+
+        // Opening runs the SDK's migrations, which would reset a database
+        // whose schema version the snapshot lost.
+        let reopened = VotingDb::open_path(&restored).unwrap();
+        reopened.set_wallet_id(&wallet);
+        let rounds = reopened.list_rounds().unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].round_id, "round");
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

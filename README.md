@@ -13,7 +13,7 @@ When asked to build the application, produce a production-optimized release buil
 Prerequisites:
 
 - macOS with Xcode Command Line Tools
-- Rust 1.91 or newer
+- Rust 1.97 or newer
 - Node.js 20.19 or newer
 
 From the repository root:
@@ -70,6 +70,7 @@ The operation is recoverable. Each scan batch is committed to the isolated walle
 6. Wait until every named delegation transaction is confirmed.
 7. Review the network, round, and one selection per proposal.
 8. Generate, sign, submit, and confirm the votes. If the app is interrupted, start the same action again to recover the persisted signed vote instead of producing a conflicting one.
+9. Keep the app open when you can. It keeps confirming helper shares in the background until the round ends, and resumes that when it starts again.
 
 Mainnet and Testnet are separate profiles with separate databases, manifests, and Keychain namespaces. Development and debug builds default to Local Demo. Production release builds omit that selector and default to Testnet. Mainnet always has a persistent production warning.
 
@@ -82,7 +83,7 @@ Mainnet and Testnet are separate profiles with separate databases, manifests, an
 - Voting is blocked until every imported delegation has an on-chain VAN position.
 - Signed vote recovery is persisted before network submission, so an uncertain or interrupted submission can resume safely.
 - Development and debug builds include a Testnet custodian harness that recovers ZIP-32 account 0 from a supplied mnemonic and birthday into a private SQLite database, syncs only through the authenticated round snapshot, and persists signed delegation bytes before broadcast. The harness is excluded from production release builds.
-- HTTP responses are bounded while streaming. A helper share is recorded only after the configured helper redundancy target accepts it.
+- HTTP responses are bounded while streaming. `zcash_voting` owns vote submission and helper share delivery, including when each share is revealed, so custody votes follow the same timing as other wallets.
 - Recovery backups use passphrase-based age encryption and contain only voting state and voting hotkeys. They never contain custody funds, wallet seeds, or mnemonics.
 
 Test custodian jobs are deliberately excluded from customer recovery backups. They can contain privacy-sensitive recovered-wallet data and provider-side proof state, so use the harness only with disposable Testnet wallets and remove the app's local data when the rehearsal is no longer needed.
@@ -154,7 +155,8 @@ xcrun stapler validate Custody-Voter-macos.dmg
 ## Current scope
 
 - The first release is a desktop app. There is no hosted web version because a browser would put voting-secret storage and native proof dependencies behind a weaker boundary.
-- Voting supports proposal IDs 1–50 using the LRZ maintenance SDK and its matching circuits. Custodians must generate delegations with the same 50-proposal circuit generation. The V1 target and capability JSON formats are unchanged; this does not make old 15-proposal delegation proofs or commitments compatible. Preserve existing backups and hotkeys when upgrading.
+- Voting supports proposal IDs 1–50 using `zcash_voting` 5 with its LRZ backend and matching circuits. Custodians must generate delegations with the same 50-proposal circuit generation. The V1 target and capability JSON formats are unchanged; this does not make old 15-proposal delegation proofs or commitments compatible. Preserve existing backups and hotkeys when upgrading.
+- Upgrading from 1.0.x moves the voting database to the 5.x schema. Finish any vote that is still submitting or delivering helper shares before upgrading, because the new SDK does not resume work the old one left in flight.
 - Mainnet and Testnet use the currently pinned Valar voting configuration revisions. Updating those trust anchors is an intentional source change and release event.
 - GitHub release DMGs are signed and notarized for direct macOS distribution. An automatic update channel remains future deployment work.
 

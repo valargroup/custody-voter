@@ -61,16 +61,18 @@ stateDiagram-v2
     [*] --> RoundSelected
     RoundSelected --> TargetReady: Generate hotkey and public target
     TargetReady --> CapabilityImported: Strict canonical import
-    CapabilityImported --> DelegationsConfirmed: Confirm every custody transaction
-    DelegationsConfirmed --> VotePersisted: Build proof and sign locally
-    VotePersisted --> VoteSubmitted: Broadcast signed payload
-    VoteSubmitted --> VoteConfirmed: Parse on-chain positions
-    VoteConfirmed --> SharesSubmitted: Meet helper redundancy policy
-    VotePersisted --> VotePersisted: Recover after interruption
-    VoteSubmitted --> VoteSubmitted: Poll after uncertain confirmation
+    CapabilityImported --> DelegationsConfirmed: SDK polls each custody transaction
+    DelegationsConfirmed --> BallotRecorded: Record every choice
+    BallotRecorded --> VotesConfirmed: SDK round driver proves, signs, submits, and confirms
+    VotesConfirmed --> SharesDelivered: SDK plans and delivers helper shares
+    SharesDelivered --> SharesConfirmed: Background tracking until vote end
 ```
 
-The database is the recovery source of truth after a vote commitment is built. A retry never rebuilds a commitment with a different selection under the same bundle and proposal key.
+The voting database is the recovery source of truth, and `zcash_voting` owns every transition after the ballot is recorded. Its round driver casts each bundle's choices, follows them to confirmation, and delivers helper shares on the SDK's schedule. Running it again resumes from durable state. A changed choice replaces a commitment only before it reaches the vote chain.
+
+After the foreground run, the SDK's tracking driver confirms the remaining helper shares and reconciles uncertain deliveries. The app runs it in the background from the first share delivery of each cast, and at launch for every round with unconfirmed shares, until vote end. It always takes its helpers from the pinned config, never from a stored or restored snapshot.
+
+The Local Demo uses the same SDK chain lifecycle against an in-process stand-in for the vote chain. It proves each vote for real and submits it alone, and it has no helper fleet, so no shares are delivered.
 
 ## Network authentication
 
@@ -80,7 +82,7 @@ All remote requests run in Rust with TLS, connect and total timeouts, failover a
 
 ## Backup and restore
 
-An export checkpoints SQLite, reads every round hotkey from Keychain, serializes one profile, and encrypts the envelope with age scrypt passphrase encryption. Sensitive serialized fields are zeroized when the envelope is dropped.
+An export takes a consistent `VACUUM INTO` snapshot of SQLite, so background tracking can keep writing, reads every round hotkey from Keychain, serializes one profile, and encrypts the envelope with age scrypt passphrase encryption. Sensitive serialized fields are zeroized when the envelope is dropped.
 
 Restore performs these checks before activation:
 
