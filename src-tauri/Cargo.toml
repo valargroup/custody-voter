@@ -53,6 +53,11 @@ zip32 = "0.3"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
+# Dev builds run the debug-only Testnet test custodian, whose wallet scan is
+# about 12 times slower unoptimized. Release builds are unaffected.
+[profile.dev]
+opt-level = 3
+
 [patch.crates-io]
 # Pin the voting workspace to the fix that lets imported capability bundles
 # cast votes, built on the seven-day helper-share delay cap, until a
