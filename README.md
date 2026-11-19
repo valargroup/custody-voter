@@ -156,7 +156,7 @@ xcrun stapler validate Custody-Voter-macos.dmg
 
 - The first release is a desktop app. There is no hosted web version because a browser would put voting-secret storage and native proof dependencies behind a weaker boundary.
 - Voting supports proposal IDs 1–50 using `zcash_voting` 5 with its LRZ backend and matching circuits. Custodians must generate delegations with the same 50-proposal circuit generation. The V1 target and capability JSON formats are unchanged; this does not make old 15-proposal delegation proofs or commitments compatible. Preserve existing backups and hotkeys when upgrading.
-- Upgrading from 1.0.x moves the voting database to the 5.x schema. Finish any vote that is still submitting or delivering helper shares before upgrading, because the new SDK does not resume work the old one left in flight.
+- Upgrading from 1.0.x moves the voting database to the 5.x schema. Finish any vote that is still submitting or delivering helper shares before upgrading, because the new SDK does not resume work the old one left in flight. The first launch after upgrading keeps the old database in the profile folder as `voting.sqlite.before-v5` until Reset. To finish a vote left in flight anyway, quit the app, move `voting.sqlite` and its `-wal` and `-shm` files aside, rename the copy to `voting.sqlite`, and reopen it in 1.0.x.
 - Mainnet and Testnet use the currently pinned Valar voting configuration revisions. Updating those trust anchors is an intentional source change and release event.
 - GitHub release DMGs are signed and notarized for direct macOS distribution. An automatic update channel remains future deployment work.
 
