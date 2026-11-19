@@ -4,9 +4,10 @@ mod model;
 mod storage;
 #[cfg(debug_assertions)]
 mod test_custodian;
+mod tracking;
 mod voter;
 
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{collections::HashSet, fs, path::PathBuf, sync::Arc};
 
 #[cfg(debug_assertions)]
 use model::TestCustodianResult;
@@ -18,11 +19,20 @@ use reqwest::Client;
 use storage::{profile_paths, read_manifest, round_progress, vote_records};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
+use tracking::ShareTracking;
 use uuid::Uuid;
+
+/// Profiles whose helper shares are tracked in the background. The local
+/// demo delivers no shares.
+const TRACKED_PROFILES: [Profile; 2] = [Profile::Mainnet, Profile::Testnet];
 
 struct AppState {
     app_data_dir: PathBuf,
     client: Client,
+    /// One SDK transport, and so one set of worker threads, for every vote
+    /// chain, vote tree, and helper request.
+    transport: Arc<chain::VotingTransport>,
+    tracking: ShareTracking,
     operation_lock: Mutex<()>,
     reset_token: Mutex<Option<String>>,
 }
@@ -160,7 +170,14 @@ async fn import_capability(
     let _guard = state.operation_lock.lock().await;
     let paths = profile_paths(&state.app_data_dir, profile)?;
     let round = chain::fetch_round(&state.client, profile, &round_id).await?;
-    voter::import_capability(&state.client, &paths, profile, round, capability_bytes).await
+    voter::import_capability(
+        Arc::clone(&state.transport),
+        &paths,
+        profile,
+        round,
+        capability_bytes,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -172,7 +189,7 @@ async fn check_delegation_confirmations(
     let _guard = state.operation_lock.lock().await;
     let paths = profile_paths(&state.app_data_dir, profile)?;
     let round = chain::fetch_round(&state.client, profile, &round_id).await?;
-    voter::refresh_delegations(&state.client, &paths, profile, &round).await
+    voter::refresh_delegations(Arc::clone(&state.transport), &paths, profile, &round).await
 }
 
 #[cfg(debug_assertions)]
@@ -220,7 +237,38 @@ async fn cast_votes(
     let _guard = state.operation_lock.lock().await;
     let paths = profile_paths(&state.app_data_dir, profile)?;
     let round = chain::fetch_round(&state.client, profile, &round_id).await?;
-    voter::cast_votes(app, state.client.clone(), paths, profile, round, choices).await
+    // Tracking takes the stored round, whose timing passed validation, not a
+    // response this cast may reject, and the helper fleet the pinned config
+    // just authenticated, so it can start even if the config goes offline.
+    let stored = read_manifest(&paths, profile)
+        .ok()
+        .and_then(|manifest| manifest.rounds.get(&round_id).cloned());
+    let fleet = voter::service_urls(&round);
+    let start_tracking = || {
+        if let Some(stored) = &stored {
+            state.tracking.start(
+                state.client.clone(),
+                Arc::clone(&state.transport),
+                paths.clone(),
+                profile,
+                stored.snapshot.clone(),
+                Some(fleet.clone()),
+            );
+        }
+    };
+    let result = voter::cast_votes(
+        app,
+        Arc::clone(&state.transport),
+        paths.clone(),
+        profile,
+        round,
+        choices,
+        &start_tracking,
+    )
+    .await;
+    // Even a failed run may have delivered shares that need confirming.
+    start_tracking();
+    result
 }
 
 #[tauri::command]
@@ -243,7 +291,17 @@ async fn restore_backup(
 ) -> Result<RestoreResult, String> {
     let _guard = state.operation_lock.lock().await;
     let paths = profile_paths(&state.app_data_dir, profile)?;
-    storage::restore_backup(&paths, profile, passphrase, encrypted_bytes)
+    // Tracking holds the database open, so it stops before the file is
+    // replaced and resumes against whatever the profile holds afterwards.
+    state.tracking.stop(Some(profile)).await;
+    let result = storage::restore_backup(&paths, profile, passphrase, encrypted_bytes);
+    state.tracking.resume(
+        &state.client,
+        &state.transport,
+        &state.app_data_dir,
+        &[profile],
+    );
+    result
 }
 
 #[tauri::command]
@@ -262,6 +320,7 @@ async fn reset_all_data(
     if state.reset_token.lock().await.as_deref() != Some(confirmation_token.as_str()) {
         return Err("reset confirmation is missing or expired".to_string());
     }
+    state.tracking.stop(None).await;
     let result = storage::reset_all_data(&state.app_data_dir);
     if result.is_ok() {
         state.reset_token.lock().await.take();
@@ -281,9 +340,18 @@ pub fn run() {
             app.manage(AppState {
                 app_data_dir,
                 client: chain::http_client().map_err(std::io::Error::other)?,
+                transport: Arc::new(chain::voting_transport().map_err(std::io::Error::other)?),
+                tracking: ShareTracking::default(),
                 operation_lock: Mutex::new(()),
                 reset_token: Mutex::new(None),
             });
+            let state = app.state::<AppState>();
+            state.tracking.resume(
+                &state.client,
+                &state.transport,
+                &state.app_data_dir,
+                &TRACKED_PROFILES,
+            );
             Ok(())
         });
     #[cfg(debug_assertions)]

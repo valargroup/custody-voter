@@ -9,10 +9,8 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bip0039::{English, Mnemonic};
-use ff::PrimeField;
-use pasta_curves::pallas;
 use prost::Message;
-use rand::rngs::OsRng;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use reqwest::{Client, Url};
 use rusqlite::{Connection, OpenFlags};
 use secrecy::{ExposeSecret, SecretVec};
@@ -41,6 +39,10 @@ use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db, Accou
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 use zcash_voting::{
+    backend::{
+        orchard,
+        pasta_curves::{group::ff::PrimeField, pallas},
+    },
     delegate::{
         DelegationProgress, DelegationSigningRequest, DelegationSubmission,
         PrepareDelegationBundleForTargetParams, PreparedSigner, ResolveDelegationLwdParams,
@@ -73,7 +75,7 @@ const LIGHTWALLETD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LIGHTWALLETD_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LIGHTWALLETD_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-type TestWalletDb = WalletDb<Connection, Network, SystemClock, OsRng>;
+type TestWalletDb = WalletDb<Connection, Network, SystemClock, UnwrapErr<SysRng>>;
 
 #[derive(Clone)]
 struct JobPaths {
@@ -310,7 +312,9 @@ pub async fn generate_payload(
         None,
         "Authenticating Testnet services and matching the PIR snapshot",
     );
-    let environment = chain::resolve_environment(&client, crate::model::Profile::Testnet).await?;
+    let environment = chain::resolve_environment(&client, crate::model::Profile::Testnet)
+        .await
+        .map_err(|failure| failure.to_string())?;
     let pir_endpoint =
         chain::resolve_pir_endpoint(&client, &environment, round.snapshot_height).await?;
     let lwd = zcash_voting::delegate::gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
@@ -813,14 +817,6 @@ fn mark_broadcast_accepted(
     if entry.tx_hash != tx_hash {
         return Err("broadcast transaction hash conflicts with persisted job state".to_string());
     }
-    let provider_db = open_provider_db(paths)?;
-    zcash_voting::delegate::record_submission(
-        &provider_db,
-        &context.round.round_id,
-        bundle_index,
-        tx_hash,
-    )
-    .map_err(|error| format!("record test delegation submission failed: {error}"))?;
     entry.broadcast_accepted = true;
     write_job(paths, &job)
 }
@@ -983,7 +979,7 @@ fn sign_delegation_request(
     let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(request.alpha))
         .ok_or_else(|| "delegation randomizer is not a canonical Pallas scalar".to_string())?;
     let randomized = ask.randomize(&alpha);
-    let signature = randomized.sign(OsRng, &request.sighash);
+    let signature = randomized.sign(UnwrapErr(SysRng), &request.sighash);
     Ok(((&signature).into(), request.sighash))
 }
 
@@ -1352,7 +1348,7 @@ fn open_wallet_readonly(path: &Path) -> Result<TestWalletDb, String> {
         connection,
         Network::Testnet,
         SystemClock,
-        OsRng,
+        UnwrapErr(SysRng),
     ))
 }
 
@@ -1375,7 +1371,7 @@ fn open_wallet_database(path: &Path) -> Result<TestWalletDb, String> {
         connection,
         Network::Testnet,
         SystemClock,
-        OsRng,
+        UnwrapErr(SysRng),
     ))
 }
 

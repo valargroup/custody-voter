@@ -1,10 +1,12 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, fmt, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use reqwest::{header, Client, StatusCode};
+#[cfg(any(debug_assertions, test))]
+use reqwest::StatusCode;
+use reqwest::{header, Client};
+#[cfg(any(debug_assertions, test))]
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::time::sleep;
 #[cfg(debug_assertions)]
 use zcash_voting::pir::{
     classify_pir_snapshot_height, select_pir_endpoint, PirSnapshotEndpointDiagnostic,
@@ -13,10 +15,10 @@ use zcash_voting::pir::{
 use zcash_voting::{
     config::{
         resolve_dynamic_voting_config, resolve_static_voting_config, PinnedConfigSource,
-        ResolveVotingConfigOptions, ResolvedVotingConfig,
+        ResolveVotingConfigOptions, ResolvedVotingConfig, VotingConfigError,
     },
-    confirmation::TxEvent,
-    validate_proposal_id, validate_round_params, validate_vote_options, MAX_PROPOSAL_ID,
+    validate_proposal_id, validate_round_params, validate_vote_options, HyperTransport, RouteError,
+    RouteFuture, RouteHttp, RouteRequest, RouteResponse, MAX_PROPOSAL_ID,
 };
 
 use crate::model::{AppOption, AppProposal, Profile, RoundSnapshot, ServiceEndpointView};
@@ -32,56 +34,183 @@ const MAX_ROUNDS_PER_RESPONSE: usize = 4_096;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_DESCRIPTION_BYTES: usize = 64 * 1_024;
 const MAX_OPTION_DESCRIPTION_BYTES: usize = 16 * 1_024;
-const TX_CONFIRMATION_ATTEMPTS: usize = 45;
-const TX_CONFIRMATION_DELAY: Duration = Duration::from_secs(2);
+
+/// Bound on connection setup, including TLS and any proxy tunnel.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub fn http_client() -> Result<Client, String> {
     Client::builder()
-        .connect_timeout(Duration::from_secs(12))
+        .connect_timeout(CONNECT_TIMEOUT)
         .timeout(Duration::from_secs(30))
         .user_agent(format!("valar-custody-voter/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| format!("build HTTP client failed: {error}"))
 }
 
+/// The SDK transport for vote-chain, vote-tree, and helper traffic.
+pub type VotingTransport = HyperTransport<ReqwestRoute>;
+
+/// Builds the SDK transport over [`ReqwestRoute`].
+pub fn voting_transport() -> Result<VotingTransport, String> {
+    // The SDK bounds each whole request, up to minutes for a chain POST. A
+    // server that stalls during connection setup must fail over well before
+    // that, and as a connect failure, which says no vote bytes left.
+    let client = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("build voting HTTP client failed: {error}"))?;
+    Ok(HyperTransport::with_route(ReqwestRoute { client }))
+}
+
+/// Executes the SDK's HTTP requests with reqwest, so voting traffic takes the
+/// same proxy route as round discovery instead of connecting directly.
+///
+/// It follows no redirects, as [`RouteHttp`] requires, and sends no
+/// User-Agent, like the SDK's own direct route, so custody traffic does not
+/// stand out to helpers.
+pub struct ReqwestRoute {
+    client: Client,
+}
+
+impl RouteHttp for ReqwestRoute {
+    fn execute<'a>(
+        &'a self,
+        request: RouteRequest<'a>,
+        on_dispatch: &'a (dyn Fn() + Send + Sync),
+    ) -> RouteFuture<'a> {
+        Box::pin(async move {
+            let mut builder = self
+                .client
+                .request(request.method, request.url)
+                .timeout(request.timeout)
+                .body(request.body);
+            for (name, value) in request.headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            // reqwest has no hook between connection setup and the first
+            // write, so dispatch is marked before both. A connect failure,
+            // which reqwest reports distinctly, stays pre-dispatch.
+            on_dispatch();
+            let mut response = builder.send().await.map_err(|error| {
+                let message = format!("send HTTP request: {error}");
+                if error.is_connect() {
+                    RouteError::before_dispatch(message)
+                } else {
+                    RouteError::after_dispatch(message)
+                }
+            })?;
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .collect();
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                RouteError::response_read(format!("read HTTP response body: {error}"))
+            })? {
+                if body.len().saturating_add(chunk.len()) > request.max_response_bytes {
+                    return Err(RouteError::response_read(format!(
+                        "HTTP response exceeds {} bytes",
+                        request.max_response_bytes
+                    )));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(RouteResponse {
+                status,
+                headers,
+                body,
+            })
+        })
+    }
+
+    fn hook_precedes_connection_setup(&self) -> bool {
+        true
+    }
+}
+
+/// Why the pinned voting config could not be used.
+#[derive(Debug)]
+pub enum ConfigFailure {
+    /// The config advertises a protocol version this build does not support.
+    Unsupported(String),
+    /// The config could not be fetched, parsed, or authenticated.
+    Unavailable(String),
+}
+
+impl fmt::Display for ConfigFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (Self::Unsupported(message) | Self::Unavailable(message)) = self;
+        formatter.write_str(message)
+    }
+}
+
+/// Labels an SDK config error with the step that failed, keeping an
+/// unsupported version apart from every other failure.
+fn config_failure(step: &str, error: VotingConfigError) -> ConfigFailure {
+    let message = format!("{step} failed: {error}");
+    match error {
+        VotingConfigError::UnsupportedVersion { .. } => ConfigFailure::Unsupported(message),
+        _ => ConfigFailure::Unavailable(message),
+    }
+}
+
+/// Fetches and authenticates the profile's pinned voting config.
 pub async fn resolve_environment(
     client: &Client,
     profile: Profile,
-) -> Result<ResolvedVotingConfig, String> {
+) -> Result<ResolvedVotingConfig, ConfigFailure> {
     let source = match profile {
         Profile::Mainnet => MAINNET_CONFIG_SOURCE,
         Profile::Testnet => TESTNET_CONFIG_SOURCE,
-        Profile::Demo => return Err("the local demo does not use remote voting config".to_string()),
+        Profile::Demo => {
+            return Err(ConfigFailure::Unavailable(
+                "the local demo does not use remote voting config".to_string(),
+            ))
+        }
     };
     let parsed = PinnedConfigSource::parse(source)
-        .map_err(|error| format!("parse pinned voting config source failed: {error}"))?;
-    let static_bytes = fetch_bytes(client, &parsed.url, MAX_CONFIG_BYTES).await?;
+        .map_err(|error| config_failure("parse pinned voting config source", error))?;
+    let static_bytes = fetch_bytes(client, &parsed.url, MAX_CONFIG_BYTES)
+        .await
+        .map_err(ConfigFailure::Unavailable)?;
     let resolved_static = resolve_static_voting_config(source, &static_bytes)
-        .map_err(|error| format!("authenticate static voting config failed: {error}"))?;
+        .map_err(|error| config_failure("authenticate static voting config", error))?;
     let dynamic_bytes = fetch_bytes(
         client,
         &resolved_static.dynamic_config_url,
         MAX_CONFIG_BYTES,
     )
-    .await?;
+    .await
+    .map_err(ConfigFailure::Unavailable)?;
     resolve_dynamic_voting_config(
         resolved_static,
         &dynamic_bytes,
         ResolveVotingConfigOptions::default(),
     )
-    .map_err(|error| format!("authenticate dynamic voting config failed: {error}"))
+    .map_err(|error| config_failure("authenticate dynamic voting config", error))
 }
 
 pub async fn list_rounds(client: &Client, profile: Profile) -> Result<Vec<RoundSnapshot>, String> {
     if profile.is_demo() {
         return Ok(vec![crate::demo::round_snapshot()]);
     }
-    let environment = resolve_environment(client, profile).await?;
+    let environment = resolve_environment(client, profile)
+        .await
+        .map_err(|failure| failure.to_string())?;
     let servers = vote_server_views(&environment);
     get_from_vote_servers(client, &servers, "/shielded-vote/v1/rounds", |response| {
         parse_round_list_response(profile, &environment, response)
     })
     .await
+    .map(|(rounds, _)| rounds)
 }
 
 fn parse_round_list_response(
@@ -164,7 +293,9 @@ pub async fn fetch_round(
     }
     zcash_voting::types::validate_vote_round_id_hex(round_id)
         .map_err(|error| format!("invalid round id: {error}"))?;
-    let environment = resolve_environment(client, profile).await?;
+    let environment = resolve_environment(client, profile)
+        .await
+        .map_err(|failure| failure.to_string())?;
     if !environment
         .authenticated_rounds
         .iter()
@@ -176,10 +307,14 @@ pub async fn fetch_round(
     }
     let path = format!("/shielded-vote/v1/round/{round_id}");
     let servers = vote_server_views(&environment);
-    get_from_vote_servers(client, &servers, &path, |response| {
+    let (mut round, answered) = get_from_vote_servers(client, &servers, &path, |response| {
         parse_round_response(profile, &environment, round_id, response)
     })
-    .await
+    .await?;
+    // The SDK sends a vote to only the first few configured servers, so the
+    // one that just answered goes first.
+    round.vote_servers.rotate_left(answered);
+    Ok(round)
 }
 
 fn parse_round_response(
@@ -335,14 +470,6 @@ fn parse_proposals(value: Option<&Value>) -> Result<Vec<AppProposal>, String> {
         .collect()
 }
 
-pub async fn submit_vote(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    body: &str,
-) -> Result<BroadcastResult, String> {
-    post_vote_servers(client, servers, "/shielded-vote/v1/cast-vote", body).await
-}
-
 #[cfg(debug_assertions)]
 pub async fn submit_delegation(
     client: &Client,
@@ -430,80 +557,17 @@ pub async fn resolve_pir_endpoint(
         })
 }
 
-pub async fn submit_share(client: &Client, server_url: &str, body: &str) -> Result<(), String> {
-    let url = endpoint_url(server_url, "/shielded-vote/v1/shares");
-    let response = client
-        .post(&url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.to_owned())
-        .send()
-        .await
-        .map_err(|error| format!("submit helper share to {server_url} failed: {error}"))?;
-    let status = response.status();
-    let bytes = bounded_response(response, MAX_CHAIN_RESPONSE_BYTES).await?;
-    if !status.is_success() {
-        return Err(format!(
-            "helper {server_url} rejected share with HTTP {status}: {}",
-            response_message(&bytes)
-        ));
-    }
-    Ok(())
-}
-
-pub async fn poll_validated_tx_confirmation<F>(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    tx_hash: &str,
-    mut validate: F,
-) -> Result<TxConfirmation, String>
-where
-    F: FnMut(&TxConfirmation) -> Result<(), String>,
-{
-    for attempt in 0..TX_CONFIRMATION_ATTEMPTS {
-        if let Some(confirmation) =
-            get_tx_confirmation_with(client, servers, tx_hash, &mut validate).await?
-        {
-            return Ok(confirmation);
-        }
-        if attempt + 1 < TX_CONFIRMATION_ATTEMPTS {
-            sleep(TX_CONFIRMATION_DELAY).await;
-        }
-    }
-    Err(format!(
-        "transaction {tx_hash} was not confirmed within {} seconds; retry to resume safely",
-        TX_CONFIRMATION_DELAY.as_secs() * TX_CONFIRMATION_ATTEMPTS as u64
-    ))
-}
-
+/// Looks up one delegation transaction on the configured vote servers.
+///
+/// Returns `None` while every server reports it as not yet committed, and an
+/// error only when every server failed. The test custodian uses this to avoid
+/// rebroadcasting a delegation that already landed.
+#[cfg(any(debug_assertions, test))]
 pub async fn get_tx_confirmation(
     client: &Client,
     servers: &[ServiceEndpointView],
     tx_hash: &str,
 ) -> Result<Option<TxConfirmation>, String> {
-    get_tx_confirmation_with(client, servers, tx_hash, &mut accept_any_confirmation).await
-}
-
-pub async fn get_validated_tx_confirmation<F>(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    tx_hash: &str,
-    mut validate: F,
-) -> Result<Option<TxConfirmation>, String>
-where
-    F: FnMut(&TxConfirmation) -> Result<(), String>,
-{
-    get_tx_confirmation_with(client, servers, tx_hash, &mut validate).await
-}
-
-async fn get_tx_confirmation_with<F>(
-    client: &Client,
-    servers: &[ServiceEndpointView],
-    tx_hash: &str,
-    validate: &mut F,
-) -> Result<Option<TxConfirmation>, String>
-where
-    F: FnMut(&TxConfirmation) -> Result<(), String>,
-{
     validate_tx_hash(tx_hash)?;
     let path = format!("/shielded-vote/v1/tx/{tx_hash}");
     let mut errors = Vec::new();
@@ -522,18 +586,7 @@ where
                 };
                 if status.is_success() || status == StatusCode::UNPROCESSABLE_ENTITY {
                     match serde_json::from_slice::<TxConfirmation>(&bytes) {
-                        Ok(confirmation) => {
-                            if confirmation.code == 0 {
-                                if let Err(error) = validate(&confirmation) {
-                                    errors.push(format!(
-                                        "{} returned an unusable transaction confirmation: {error}",
-                                        server.label
-                                    ));
-                                    continue;
-                                }
-                            }
-                            return Ok(Some(confirmation));
-                        }
+                        Ok(confirmation) => return Ok(Some(confirmation)),
                         Err(error) => errors.push(format!(
                             "{} returned a malformed transaction confirmation: {error}",
                             server.label
@@ -555,10 +608,7 @@ where
     Ok(None)
 }
 
-fn accept_any_confirmation(_: &TxConfirmation) -> Result<(), String> {
-    Ok(())
-}
-
+#[cfg(any(debug_assertions, test))]
 #[derive(Clone, Debug, Deserialize)]
 pub struct BroadcastResult {
     pub tx_hash: String,
@@ -567,15 +617,15 @@ pub struct BroadcastResult {
     pub log: String,
 }
 
+#[cfg(any(debug_assertions, test))]
 #[derive(Clone, Debug, Deserialize)]
 pub struct TxConfirmation {
     pub code: u64,
     #[serde(default)]
     pub log: String,
-    #[serde(default)]
-    pub events: Vec<TxEvent>,
 }
 
+#[cfg(any(debug_assertions, test))]
 async fn post_vote_servers(
     client: &Client,
     servers: &[ServiceEndpointView],
@@ -647,17 +697,18 @@ async fn post_vote_servers(
     Err(format!("all vote servers failed: {}", errors.join("; ")))
 }
 
+/// Returns the first validated answer and the index of the server that gave it.
 async fn get_from_vote_servers<T, F>(
     client: &Client,
     servers: &[ServiceEndpointView],
     path: &str,
     mut validate: F,
-) -> Result<T, String>
+) -> Result<(T, usize), String>
 where
     F: FnMut(&[u8]) -> Result<T, String>,
 {
     let mut errors = Vec::new();
-    for server in servers {
+    for (index, server) in servers.iter().enumerate() {
         let url = endpoint_url(&server.url, path);
         match client
             .get(&url)
@@ -674,7 +725,7 @@ where
                     }
                 };
                 match validate(&bytes) {
-                    Ok(value) => return Ok(value),
+                    Ok(value) => return Ok((value, index)),
                     Err(error) => errors.push(format!("{}: {error}", server.label)),
                 }
             }
@@ -833,6 +884,7 @@ fn parse_status(value: Option<&Value>) -> Result<String, String> {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
 fn validate_tx_hash(tx_hash: &str) -> Result<(), String> {
     if tx_hash.len() == 64 && tx_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
@@ -855,6 +907,7 @@ fn status_details(status: &str) -> (String, bool) {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
 fn response_message(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).chars().take(500).collect()
 }
@@ -868,6 +921,26 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn unsupported_config_versions_stay_apart_from_other_failures() {
+        let unsupported = VotingConfigError::UnsupportedVersion {
+            component: "vote_protocol".to_string(),
+            advertised: "9".to_string(),
+        };
+        let undecodable = VotingConfigError::DecodeFailed {
+            message: "truncated".to_string(),
+        };
+
+        assert!(matches!(
+            config_failure("resolve", unsupported),
+            ConfigFailure::Unsupported(_)
+        ));
+        assert!(matches!(
+            config_failure("resolve", undecodable),
+            ConfigFailure::Unavailable(_)
+        ));
+    }
 
     fn response_server(label: &str, body: &str) -> (ServiceEndpointView, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -892,6 +965,34 @@ mod tests {
             },
             handle,
         )
+    }
+
+    #[tokio::test]
+    async fn voting_transport_returns_redirects_without_following_them() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        // The server answers once, so following the redirect would fail.
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let transport = voting_transport().unwrap();
+        let response = zcash_voting::HelperTransport::get(
+            &transport,
+            &format!("http://{address}/shielded-vote/v1/status"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), 307);
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1038,39 +1139,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validated_confirmation_skips_an_unusable_success_response() {
-        let (unusable, unusable_handle) =
-            response_server("unusable", r#"{"code":0,"log":"","events":[]}"#);
-        let (healthy, healthy_handle) = response_server(
-            "healthy",
-            r#"{"code":0,"log":"confirmed","events":[{"type":"cast_vote","attributes":[]}]}"#,
-        );
-        let confirmation = get_validated_tx_confirmation(
-            &http_client().unwrap(),
-            &[unusable, healthy],
-            &"ab".repeat(32),
-            |confirmation| {
-                if confirmation.events.is_empty() {
-                    Err("missing expected confirmation event".to_string())
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(confirmation.log, "confirmed");
-        unusable_handle.join().unwrap();
-        healthy_handle.join().unwrap();
-    }
-
-    #[tokio::test]
     async fn validated_get_skips_a_malformed_success_response() {
         let (malformed, malformed_handle) = response_server("malformed", "{");
         let (healthy, healthy_handle) = response_server("healthy", r#"{"rounds":[]}"#);
-        let response = get_from_vote_servers(
+        let (response, answered) = get_from_vote_servers(
             &http_client().unwrap(),
             &[malformed, healthy],
             "/shielded-vote/v1/rounds",
@@ -1083,6 +1155,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response, serde_json::json!({"rounds": []}));
+        assert_eq!(answered, 1);
         malformed_handle.join().unwrap();
         healthy_handle.join().unwrap();
     }
