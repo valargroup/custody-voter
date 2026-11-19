@@ -67,7 +67,9 @@ use crate::{
 const JOB_FORMAT_VERSION: u32 = 2;
 const DELEGATE_VOTE_TAG: u8 = 0x02;
 const ZIP32_ACCOUNT_INDEX: u32 = 0;
-const SYNC_BATCH_SIZE: u64 = 300;
+/// Blocks per committed scan batch. The sync holds two batches at once, one
+/// scanning and the next downloading.
+const SYNC_BATCH_SIZE: u64 = 2_000;
 const MAX_MNEMONIC_BYTES: usize = 2_048;
 const MAX_JOB_BYTES: u64 = 256 * 1024 * 1024;
 const WALLET_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -272,12 +274,21 @@ pub async fn generate_payload(
     .map_err(|error| format!("test wallet initialization task failed: {error}"))??;
 
     sync_wallet_to_snapshot(
-        &app,
-        &mut lightwalletd,
+        &lightwalletd,
         &paths.wallet_database,
-        &round.round_id,
         birthday_height,
         snapshot_height,
+        |progress, message| {
+            emit_progress(
+                &app,
+                &round.round_id,
+                "wallet_sync",
+                None,
+                None,
+                Some(progress),
+                &message,
+            )
+        },
     )
     .await?;
     drop(lightwalletd);
@@ -1120,15 +1131,38 @@ async fn download_compact_blocks(
     Ok(blocks)
 }
 
+/// Downloads compact blocks `start..=end` and the tree state just below them,
+/// as two concurrent requests on the same lightwalletd connection.
+async fn download_scan_batch(
+    client: &CompactTxStreamerClient<Channel>,
+    start: u64,
+    end: u64,
+) -> Result<(TreeState, Vec<CompactBlock>), String> {
+    let mut state_client = client.clone();
+    let mut block_client = client.clone();
+    tokio::try_join!(
+        fetch_tree_state(&mut state_client, start - 1),
+        download_compact_blocks(&mut block_client, start, end),
+    )
+}
+
+/// Scans the recovered wallet from where it stopped through `snapshot_height`,
+/// committing one batch at a time and reporting progress after each step.
+///
+/// The next batch downloads while the current one scans. The wallet's fully
+/// scanned height still picks every batch, so a resumed run continues after
+/// the last committed batch, and a download that doesn't line up with it is
+/// discarded.
 async fn sync_wallet_to_snapshot(
-    app: &AppHandle,
-    client: &mut CompactTxStreamerClient<Channel>,
+    client: &CompactTxStreamerClient<Channel>,
     wallet_path: &Path,
-    round_id: &str,
     birthday_height: u64,
     snapshot_height: u64,
+    report: impl Fn(f64, String),
 ) -> Result<(), String> {
     let total_blocks = snapshot_height - birthday_height + 1;
+    let batch_end = |start: u64| (start + SYNC_BATCH_SIZE - 1).min(snapshot_height);
+    let mut prefetched = None;
     loop {
         let height_path = wallet_path.to_path_buf();
         let scanned_height = tauri::async_runtime::spawn_blocking(move || {
@@ -1139,48 +1173,43 @@ async fn sync_wallet_to_snapshot(
         .map_err(|error| format!("read Testnet sync progress task failed: {error}"))??
         .unwrap_or(birthday_height - 1);
         if scanned_height >= snapshot_height {
-            emit_progress(
-                app,
-                round_id,
-                "wallet_sync",
-                None,
-                None,
-                Some(1.0),
-                &format!("Recovered account 0 through snapshot height {snapshot_height}"),
+            report(
+                1.0,
+                format!("Recovered account 0 through snapshot height {snapshot_height}"),
             );
             return Ok(());
         }
 
         let start = (scanned_height + 1).max(birthday_height);
-        let end = (start + SYNC_BATCH_SIZE - 1).min(snapshot_height);
-        let completed_before = start - birthday_height;
-        emit_progress(
-            app,
-            round_id,
-            "wallet_sync",
-            None,
-            None,
-            Some(completed_before as f64 / total_blocks as f64),
-            &format!("Downloading Testnet blocks {start} through {end}"),
+        let end = batch_end(start);
+        report(
+            (start - birthday_height) as f64 / total_blocks as f64,
+            format!("Scanning Testnet blocks {start} through {end}"),
         );
-        let from_state = fetch_tree_state(client, start - 1).await?;
-        let blocks = download_compact_blocks(client, start, end).await?;
+        let (from_state, blocks) = match prefetched.take() {
+            Some((prefetched_start, batch)) if prefetched_start == start => batch?,
+            _ => download_scan_batch(client, start, end).await?,
+        };
         let scan_path = wallet_path.to_path_buf();
-        tauri::async_runtime::spawn_blocking(move || {
+        let scan = tauri::async_runtime::spawn_blocking(move || {
             scan_wallet_batch(&scan_path, start, end, from_state, blocks)
-        })
-        .await
-        .map_err(|error| format!("Testnet wallet scan task failed: {error}"))??;
-
-        let completed = end - birthday_height + 1;
-        emit_progress(
-            app,
-            round_id,
-            "wallet_sync",
-            None,
-            None,
-            Some(completed as f64 / total_blocks as f64),
-            &format!("Scanned account 0 through Testnet height {end}"),
+        });
+        let next_start = end + 1;
+        let prefetch = async {
+            if next_start > snapshot_height {
+                return None;
+            }
+            let batch = download_scan_batch(client, next_start, batch_end(next_start)).await;
+            Some((next_start, batch))
+        };
+        // Waiting for both keeps a failed download from returning while the
+        // scan is still writing to the wallet.
+        let (scanned, next) = tokio::join!(scan, prefetch);
+        scanned.map_err(|error| format!("Testnet wallet scan task failed: {error}"))??;
+        prefetched = next;
+        report(
+            (end - birthday_height + 1) as f64 / total_blocks as f64,
+            format!("Scanned account 0 through Testnet height {end}"),
         );
     }
 }
@@ -1710,10 +1739,11 @@ mod tests {
             manifest: temp.join("job.json"),
             wallet_id: "test-wallet".to_string(),
         };
-        // This range ends at a Stage snapshot after Testnet NU6.3, so the
-        // smoke test exercises Ironwood compact blocks across two batches.
-        let birthday_height = 4_245_160;
-        let snapshot_height = birthday_height + SYNC_BATCH_SIZE;
+        // This range ends at a Stage snapshot after Testnet NU6.3 and spans two
+        // full batches plus a one-block batch, so the smoke test exercises
+        // Ironwood compact blocks and the prefetched batches.
+        let snapshot_height = 4_245_460;
+        let birthday_height = snapshot_height - 2 * SYNC_BATCH_SIZE;
         let mut client = open_lightwalletd("https://testnet.zec.rocks:443")
             .await
             .unwrap();
@@ -1729,17 +1759,15 @@ mod tests {
             seed,
         )
         .unwrap();
-        let first_end = birthday_height + SYNC_BATCH_SIZE - 1;
-        for (start, end) in [
-            (birthday_height, first_end),
-            (first_end + 1, snapshot_height),
-        ] {
-            let blocks = download_compact_blocks(&mut client, start, end)
-                .await
-                .unwrap();
-            let from_state = fetch_tree_state(&mut client, start - 1).await.unwrap();
-            scan_wallet_batch(&paths.wallet_database, start, end, from_state, blocks).unwrap();
-        }
+        sync_wallet_to_snapshot(
+            &client,
+            &paths.wallet_database,
+            birthday_height,
+            snapshot_height,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
         let wallet = open_wallet_readonly(&paths.wallet_database).unwrap();
         assert_eq!(
             fully_scanned_height(&wallet).unwrap(),
