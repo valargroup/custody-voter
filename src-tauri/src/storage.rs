@@ -27,6 +27,10 @@ const MAX_BACKUP_PASSPHRASE_CHARS: usize = 1_024;
 const MAX_BACKUP_DATABASE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_ENCRYPTED_BACKUP_BYTES: usize = 192 * 1024 * 1024;
 
+/// The voting database schema that `zcash_voting` 3.0 and 4.0 write, which
+/// covers every database custody-voter made before the v5 SDK.
+const PRE_V5_SCHEMA_VERSION: u32 = 13;
+
 /// SQL condition for a vote row that still records a vote, because it holds a
 /// signed commitment or reached the chain.
 ///
@@ -72,10 +76,43 @@ pub fn wallet_id(profile: Profile) -> String {
 }
 
 pub fn open_db(paths: &ProfilePaths, profile: Profile) -> Result<VotingDb, String> {
+    keep_pre_v5_copy(paths)?;
     let db = VotingDb::open_path(&paths.database)
         .map_err(|error| format!("open voting database failed: {error}"))?;
     db.set_wallet_id(&wallet_id(profile));
     Ok(db)
+}
+
+/// Copies a database still at [`PRE_V5_SCHEMA_VERSION`] to
+/// `voting.sqlite.before-v5` before the SDK upgrades it in place.
+///
+/// The v5 SDK doesn't resume a vote that 4.0 left in flight, and the 4.0 app
+/// can't open the upgraded file, so this copy is how a customer goes back to
+/// finish one. Each copy replaces the last, so a customer who went back and
+/// then upgrades again keeps their newest 4.0 state. An upgraded database only
+/// costs the read-only version check.
+fn keep_pre_v5_copy(paths: &ProfilePaths) -> Result<(), String> {
+    if !paths.database.exists() {
+        return Ok(());
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &paths.database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("inspect voting database failed: {error}"))?;
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| format!("read voting database version failed: {error}"))?;
+    if version != PRE_V5_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let staged = paths
+        .directory
+        .join(format!("voting.sqlite.before-v5-{}", Uuid::new_v4()));
+    let _staged_cleanup = TemporaryDatabase(staged.clone());
+    vacuum_into(&conn, &staged)?;
+    replace_file(&staged, &paths.directory.join("voting.sqlite.before-v5"))
+        .map_err(|error| format!("keep pre-v5 voting database copy failed: {error}"))
 }
 
 pub fn read_manifest(paths: &ProfilePaths, profile: Profile) -> Result<ProfileManifest, String> {
@@ -492,23 +529,27 @@ pub fn export_backup(
 }
 
 /// Copies the profile's voting database as one consistent snapshot.
-///
-/// `VACUUM INTO` reads a single transaction, so background tracking can keep
-/// writing while the backup is taken. A checkpoint followed by a file copy
-/// could capture pages from two database states.
 fn snapshot_database(paths: &ProfilePaths, profile: Profile) -> Result<Vec<u8>, String> {
     let snapshot = paths
         .directory
         .join(format!("voting.sqlite.export-{}", Uuid::new_v4()));
     let _snapshot_cleanup = TemporaryDatabase(snapshot.clone());
-    let target = snapshot
-        .to_str()
-        .ok_or_else(|| "backup snapshot path is not valid UTF-8".to_string())?;
-    open_db(paths, profile)?
-        .conn()
-        .execute("VACUUM INTO ?1", [target])
-        .map_err(|error| format!("snapshot voting database failed: {error}"))?;
+    vacuum_into(&open_db(paths, profile)?.conn(), &snapshot)?;
     fs::read(&snapshot).map_err(|error| format!("read voting database snapshot failed: {error}"))
+}
+
+/// Writes the database behind `conn` to `target` as one consistent snapshot.
+///
+/// `VACUUM INTO` reads a single transaction, so background tracking can keep
+/// writing while the snapshot is taken. A checkpoint followed by a file copy
+/// could capture pages from two database states.
+fn vacuum_into(conn: &rusqlite::Connection, target: &Path) -> Result<(), String> {
+    let target = target
+        .to_str()
+        .ok_or_else(|| "voting database snapshot path is not valid UTF-8".to_string())?;
+    conn.execute("VACUUM INTO ?1", [target])
+        .map_err(|error| format!("snapshot voting database failed: {error}"))?;
+    Ok(())
 }
 
 pub fn restore_backup(
@@ -1238,6 +1279,53 @@ mod tests {
         assert_eq!(rounds.len(), 1);
         assert_eq!(rounds[0].round_id, "round");
         drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_v5_database_is_copied_before_the_sdk_upgrades_it() {
+        fn schema_version(conn: &rusqlite::Connection) -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        }
+        fn bundles(conn: &rusqlite::Connection) -> Vec<(u32, Vec<u8>, Option<String>)> {
+            conn.prepare(
+                "SELECT bundle_index, van_comm_rand, delegation_tx_hash
+                 FROM bundles ORDER BY bundle_index",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("custody-voter-pre-v5-copy-{}", Uuid::new_v4()));
+        let paths = profile_paths(&root, Profile::Testnet).unwrap();
+        let old = rusqlite::Connection::open(&paths.database).unwrap();
+        old.execute_batch(include_str!("../tests/fixtures/v3_completed_round.sql"))
+            .unwrap();
+        // 4.0 opens its database in WAL mode, which a `.dump` doesn't keep.
+        old.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        let before = bundles(&old);
+        drop(old);
+        let copy_path = paths.directory.join("voting.sqlite.before-v5");
+        fs::write(&copy_path, b"stale copy").unwrap();
+
+        let db = open_db(&paths, Profile::Testnet).unwrap();
+        assert!(schema_version(&db.conn()) > PRE_V5_SCHEMA_VERSION);
+        assert_eq!(bundles(&db.conn()), before);
+        drop(db);
+
+        let copy = rusqlite::Connection::open_with_flags(
+            &copy_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(schema_version(&copy), PRE_V5_SCHEMA_VERSION);
+        assert_eq!(bundles(&copy), before);
+        drop(copy);
         fs::remove_dir_all(root).unwrap();
     }
 
