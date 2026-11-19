@@ -59,6 +59,6 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 # zcash_voting release includes both. Patch the whole crate family so the
 # direct vote-commitment-tree dependency resolves to the same source as
 # zcash_voting's own path dependencies.
-zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "141012c7bee3fd58f89e6fd4348e0d12cab51a49" }
-vote-commitment-tree = { git = "https://github.com/valargroup/zcash_voting.git", rev = "141012c7bee3fd58f89e6fd4348e0d12cab51a49" }
-vote-commitment-tree-client = { git = "https://github.com/valargroup/zcash_voting.git", rev = "141012c7bee3fd58f89e6fd4348e0d12cab51a49" }
+zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "f062361d8c4013705b79e00237f5c17382e12676" }
+vote-commitment-tree = { git = "https://github.com/valargroup/zcash_voting.git", rev = "f062361d8c4013705b79e00237f5c17382e12676" }
+vote-commitment-tree-client = { git = "https://github.com/valargroup/zcash_voting.git", rev = "f062361d8c4013705b79e00237f5c17382e12676" }
