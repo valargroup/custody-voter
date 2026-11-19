@@ -54,10 +54,11 @@ zip32 = "0.3"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [patch.crates-io]
-# Pin the voting workspace to the commit that raised the helper-share delay cap
-# to seven days, until a zcash_voting release includes it. Patch the whole
-# crate family so the direct vote-commitment-tree dependency resolves to the
-# same source as zcash_voting's own path dependencies.
-zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "069c9f329299306c2ae94880eb77f22b26fda111" }
-vote-commitment-tree = { git = "https://github.com/valargroup/zcash_voting.git", rev = "069c9f329299306c2ae94880eb77f22b26fda111" }
-vote-commitment-tree-client = { git = "https://github.com/valargroup/zcash_voting.git", rev = "069c9f329299306c2ae94880eb77f22b26fda111" }
+# Pin the voting workspace to the fix that lets imported capability bundles
+# cast votes, built on the seven-day helper-share delay cap, until a
+# zcash_voting release includes both. Patch the whole crate family so the
+# direct vote-commitment-tree dependency resolves to the same source as
+# zcash_voting's own path dependencies.
+zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "141012c7bee3fd58f89e6fd4348e0d12cab51a49" }
+vote-commitment-tree = { git = "https://github.com/valargroup/zcash_voting.git", rev = "141012c7bee3fd58f89e6fd4348e0d12cab51a49" }
+vote-commitment-tree-client = { git = "https://github.com/valargroup/zcash_voting.git", rev = "141012c7bee3fd58f89e6fd4348e0d12cab51a49" }
